@@ -20,7 +20,7 @@ const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
         headless: true,
-        executablePath: '/usr/bin/chromium-browser',
+        // PATH REMOVED: Allows the engine to auto-locate the cloud browser path dynamically
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox', 
@@ -64,7 +64,7 @@ async function sendDailyImage(timeOfDay) {
             return;
         }
 
-        const targetFile = files;
+        const targetFile = files[0];
         console.log(`📥 Downloading: ${targetFile.name}`);
 
         const fileMedia = await driveClient.files.get(
@@ -95,7 +95,7 @@ function setupSchedules() {
     // Morning Post: 8:00 AM daily
     cron.schedule('0 8 * * *', () => sendDailyImage('Morning'));
 
-    // Night Post: Changed to 10:00 PM daily (22 represents 10pm)
+    // Night Post: 10:00 PM daily
     cron.schedule('0 22 * * *', () => sendDailyImage('Night'));
     
     console.log('📅 Timers armed: Morning (8:00 AM) and Night (10:00 PM) daily.');

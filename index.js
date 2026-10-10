@@ -2,27 +2,42 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { auth, drive } = require('@googleapis/drive');
 const cron = require('node-cron');
+const fs = require('fs');
 require('dotenv').config();
 
-console.log('🔄 Initializing Production Background Engine...');
+console.log('🔄 Initializing Production Background Engine on Railway...');
+
+if (process.env.GOOGLE_CREDS_JSON) {
+    try {
+        fs.writeFileSync('./google-credentials.json', process.env.GOOGLE_CREDS_JSON);
+        console.log('🔑 Google Drive credentials file written successfully!');
+    } catch (err) {
+        console.error('❌ Failed to write credentials file:', err);
+    }
+}
 
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] 
+        executablePath: '/usr/bin/chromium-browser',
+        args: [
+            '--no-sandbox', 
+            '--disable-setuid-sandbox', 
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
+        ] 
     }
 });
 
 client.on('qr', (qr) => {
     console.clear();
     qrcode.generate(qr, { small: true });
-    console.log('\n👉 RAILWAY LOGS: Scan this QR Code to log back in. 👈\n');
+    console.log('\n👉 RAILWAY LOGS: Scan this QR Code to link your account. 👈\n');
 });
 
 client.on('ready', () => {
     console.log('\n🚀 AUTOMATION ENGINE IS LIVE AND RUNNING ON RAILWAY!');
-    console.log(`Active Groups: ${process.env.WHATSAPP_GROUP_IDS}`);
     setupSchedules();
 });
 
@@ -49,7 +64,7 @@ async function sendDailyImage(timeOfDay) {
             return;
         }
 
-        const targetFile = files[0];
+        const targetFile = files;
         console.log(`📥 Downloading: ${targetFile.name}`);
 
         const fileMedia = await driveClient.files.get(
@@ -80,10 +95,10 @@ function setupSchedules() {
     // Morning Post: 8:00 AM daily
     cron.schedule('0 8 * * *', () => sendDailyImage('Morning'));
 
-    // Night Post: 8:00 PM daily
-    cron.schedule('0 20 * * *', () => sendDailyImage('Night'));
+    // Night Post: Changed to 10:00 PM daily (22 represents 10pm)
+    cron.schedule('0 22 * * *', () => sendDailyImage('Night'));
     
-    console.log('📅 Timers armed: 8:00 AM and 8:00 PM daily.');
+    console.log('📅 Timers armed: Morning (8:00 AM) and Night (10:00 PM) daily.');
 }
 
 client.initialize();

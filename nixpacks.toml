@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ['...', 'nodejs', 'chromium', 'glib', 'atk', 'atkapi', 'xorg.libX11', 'xorg.libXcomposite', 'xorg.libXdamage', 'xorg.libXext', 'xorg.libXfixes', 'xorg.libXrandr', 'gbm', 'alsa-lib', 'nspr', 'nss', 'cups', 'libxkbcommon']
-
-[phases.install]
-cmds = [
-    'npm ci',
-    'npx puppeteer browsers install chrome'
-]

@@ -1,0 +1,28 @@
+2026/10/10-17:36:15.328 43ef Reusing MANIFEST /workspaces/codespaces-blank/.wwebjs_auth/session/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/10/10-17:36:15.329 43ef Recovering log #1517
+2026/10/10-17:36:15.338 43ef Reusing old log /workspaces/codespaces-blank/.wwebjs_auth/session/Default/IndexedDB/https_web.whatsapp.com_0.indexeddb.leveldb/001517.log 
+2026/10/10-17:37:27.006 43ed Compacting 1@1 + 10@2 files
+2026/10/10-17:37:27.104 43ed Generated table #1538@1: 5225 keys, 2124550 bytes
+2026/10/10-17:37:27.254 43ed Generated table #1539@1: 3903 keys, 2122568 bytes
+2026/10/10-17:37:27.341 43ed Generated table #1540@1: 3836 keys, 2124057 bytes
+2026/10/10-17:37:27.477 43ed Generated table #1541@1: 66875 keys, 2206697 bytes
+2026/10/10-17:37:27.645 43ed Generated table #1542@1: 102706 keys, 2252557 bytes
+2026/10/10-17:37:27.832 43ed Generated table #1543@1: 101697 keys, 2252207 bytes
+2026/10/10-17:37:28.048 43ed Generated table #1544@1: 100825 keys, 2250831 bytes
+2026/10/10-17:37:28.285 43ed Generated table #1545@1: 101586 keys, 2251624 bytes
+2026/10/10-17:37:28.442 43ed Generated table #1546@1: 101814 keys, 2250845 bytes
+2026/10/10-17:37:28.600 43ed Generated table #1547@1: 101672 keys, 2250747 bytes
+2026/10/10-17:37:28.616 43ed Generated table #1548@1: 10654 keys, 234521 bytes
+2026/10/10-17:37:28.616 43ed Compacted 1@1 + 10@2 files => 22321204 bytes
+2026/10/10-17:37:28.617 43ed compacted to: files[ 0 0 36 0 0 0 0 ]
+2026/10/10-17:37:28.618 43ed Delete type=2 #1510
+2026/10/10-17:37:28.618 43ed Delete type=2 #1508
+2026/10/10-17:37:28.618 43ed Delete type=2 #1502
+2026/10/10-17:37:28.618 43ed Delete type=2 #1504
+2026/10/10-17:37:28.618 43ed Delete type=2 #1501
+2026/10/10-17:37:28.618 43ed Delete type=2 #1509
+2026/10/10-17:37:28.618 43ed Delete type=2 #1519
+2026/10/10-17:37:28.618 43ed Delete type=2 #1506
+2026/10/10-17:37:28.618 43ed Delete type=2 #1503
+2026/10/10-17:37:28.618 43ed Delete type=2 #1507
+2026/10/10-17:37:28.619 43ed Delete type=2 #1505

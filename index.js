@@ -20,8 +20,8 @@ const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
         headless: true,
-        // CONTAINER DIRECTORY PATH: Points directly to the browser pre-packaged inside the official image
-        executablePath: '/usr/bin/google-chrome',
+        // SPECIFIC BINARY PATH: Correct path for the official container image
+        executablePath: '/usr/bin/google-chrome-stable',
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox', 
@@ -65,7 +65,7 @@ async function sendDailyImage(timeOfDay) {
             return;
         }
 
-        const targetFile = files;
+        const targetFile = files[0];
         console.log(`📥 Downloading: ${targetFile.name}`);
 
         const fileMedia = await driveClient.files.get(

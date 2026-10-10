@@ -1,11 +1,20 @@
-FROM node:20-slim
+FROM ghcr.io/puppeteer/puppeteer:24.1.1
 
-# Install official Google Chrome system dependencies and clean up (refer to official documentation for the full list of packages like libglib2.0-0, libnspr4, etc.)
-RUN apt-get update && apt-get install -y wget gnupg ca-certificates --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Switch container path execution to root to enable local file system updates
+USER root
 
 WORKDIR /app
+
+# Copy system dependency trackers
 COPY package*.json ./
+
+# Install project modules cleanly
 RUN npm ci
-RUN npx puppeteer browsers install chrome
-COPY . .
+
+# Copy the rest of the script application files into place
+COPY --chown=pptruser:pptruser . .
+
+# Revert execution status back to the secure system profile user account
+USER pptruser
+
 CMD ["node", "index.js"]

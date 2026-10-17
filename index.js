@@ -1,105 +1,152 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const { auth, drive } = require('@googleapis/drive');
 const cron = require('node-cron');
-const fs = require('fs');
-require('dotenv').config();
+const path = require('node:path');
+const qrcode = require('qrcode-terminal');
+const { dateNameFor, selectDateImage } = require('./lib/image-selection');
 
-console.log('🔄 Initializing Production Background Engine on Railway...');
+const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
+const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const groupIds = (process.env.WHATSAPP_GROUP_IDS || '')
+    .split(',')
+    .map((groupId) => groupId.trim())
+    .filter(Boolean);
+const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_CREDS_JSON;
+const sessionPath = process.env.WHATSAPP_AUTH_PATH || path.join(process.cwd(), '.wwebjs_auth');
 
-if (process.env.GOOGLE_CREDS_JSON) {
-    try {
-        fs.writeFileSync('./google-credentials.json', process.env.GOOGLE_CREDS_JSON);
-        console.log('🔑 Google Drive credentials file written successfully!');
-    } catch (err) {
-        console.error('❌ Failed to write credentials file:', err);
-    }
+if (!folderId) {
+    throw new Error('GOOGLE_DRIVE_FOLDER_ID must be set.');
+}
+if (!serviceAccountJson) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON must contain the Google service-account JSON.');
+}
+if (groupIds.length === 0 || groupIds.some((groupId) => !groupId.endsWith('@g.us'))) {
+    throw new Error('WHATSAPP_GROUP_IDS must be a comma-separated list of WhatsApp group IDs ending in @g.us.');
 }
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { 
-        headless: true,
-        // SPECIFIC BINARY PATH: Correct path for the official container image
-        executablePath: '/usr/bin/google-chrome-stable',
-        args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox', 
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ] 
-    }
-});
+try {
+    new Intl.DateTimeFormat('en', { timeZone: timezone });
+} catch (error) {
+    throw new Error(`SCHEDULE_TIMEZONE is not a valid IANA timezone: ${timezone}`, { cause: error });
+}
 
-client.on('qr', (qr) => {
-    console.clear();
-    qrcode.generate(qr, { small: true });
-    console.log('\n👉 RAILWAY LOGS: Scan this QR Code to link your account. 👈\n');
-});
-
-client.on('ready', () => {
-    console.log('\n🚀 AUTOMATION ENGINE IS LIVE AND RUNNING ON RAILWAY!');
-    setupSchedules();
-});
+let credentials;
+try {
+    credentials = JSON.parse(serviceAccountJson);
+} catch (error) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.', { cause: error });
+}
 
 const googleAuth = new auth.GoogleAuth({
-    keyFile: './google-credentials.json',
-    scopes: ['https://googleapis.com'],
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive.readonly'],
 });
 const driveClient = drive({ version: 'v3', auth: googleAuth });
 
-async function sendDailyImage(timeOfDay) {
+const client = new Client({
+    authStrategy: new LocalAuth({ dataPath: sessionPath }),
+    puppeteer: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    },
+});
+let schedulesStarted = false;
+
+client.on('qr', (qr) => {
+    console.log('Scan this QR code from the WhatsApp account that is authorized to post in the selected groups:');
+    qrcode.generate(qr, { small: true });
+});
+
+client.on('ready', () => {
+    console.log(`WhatsApp connected. Daily posts scheduled for 8:00 and 22:00 (${timezone}).`);
+    setupSchedules();
+});
+
+client.on('auth_failure', (message) => {
+    console.error('WhatsApp authentication failed:', message);
+});
+
+client.on('disconnected', (reason) => {
+    console.error('WhatsApp disconnected:', reason);
+});
+
+client.on('message', async (message) => {
+    if (!/^(?:!getid|getid!)$/i.test(message.body.trim())) {
+        return;
+    }
+
     try {
-        console.log(`\n[${new Date().toLocaleTimeString()}] 📦 Fetching image for: ${timeOfDay}`);
-        
+        await message.reply(`Group ID: ${message.from}`);
+    } catch (error) {
+        console.error('Failed to reply with the WhatsApp chat ID:', error);
+    }
+});
+
+async function listImagesInFolder() {
+    const files = [];
+    let pageToken;
+
+    do {
         const response = await driveClient.files.list({
-            q: `'${process.env.GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed = false`,
-            orderBy: 'createdTime asc',
-            pageSize: 5,
-            fields: 'files(id, name, mimeType)',
+            q: `'${folderId.replaceAll("'", "\\'")}' in parents and trashed = false and mimeType contains 'image/'`,
+            orderBy: 'name',
+            pageSize: 1000,
+            pageToken,
+            fields: 'nextPageToken,files(id,name,mimeType)',
         });
 
-        const files = response.data.files;
-        if (!files || files.length === 0) {
-            console.log('⚠️ Alert: No images found in Google Drive folder.');
-            return;
-        }
+        files.push(...(response.data.files || []));
+        pageToken = response.data.nextPageToken;
+    } while (pageToken);
 
-        const targetFile = files[0];
-        console.log(`📥 Downloading: ${targetFile.name}`);
+    return files;
+}
 
-        const fileMedia = await driveClient.files.get(
-            { fileId: targetFile.id, alt: 'media' },
-            { responseType: 'arraybuffer' }
-        );
-        
-        const base64Data = Buffer.from(fileMedia.data).toString('base64');
-        const media = new MessageMedia(targetFile.mimeType, base64Data, targetFile.name);
+async function sendDailyImage(slot) {
+    const imageName = dateNameFor(new Date(), timezone);
+    const image = selectDateImage(await listImagesInFolder(), imageName);
+    const response = await driveClient.files.get(
+        { fileId: image.id, alt: 'media' },
+        { responseType: 'arraybuffer' },
+    );
+    const media = new MessageMedia(
+        image.mimeType,
+        Buffer.from(response.data).toString('base64'),
+        image.name,
+    );
 
-        const targetGroupIds = process.env.WHATSAPP_GROUP_IDS.split(',');
-        for (const groupId of targetGroupIds) {
-            await client.sendMessage(groupId.trim(), media, { 
-                caption: `Daily Automated ${timeOfDay} Post` 
-            });
-        }
-        console.log(`✅ Posted to groups successfully.`);
-
-        await driveClient.files.update({ fileId: targetFile.id, requestBody: { trashed: true } });
-        console.log(`🗑️ Moved ${targetFile.name} to trash.`);
-
-    } catch (error) {
-        console.error('❌ Automation Error:', error);
+    for (const groupId of groupIds) {
+        await client.sendMessage(groupId, media);
     }
+
+    console.log(`Posted ${image.name} to ${groupIds.length} group(s) for the ${slot} slot.`);
 }
 
 function setupSchedules() {
-    // Morning Post: 8:00 AM daily
-    cron.schedule('0 8 * * *', () => sendDailyImage('Morning'));
+    if (schedulesStarted) {
+        return;
+    }
+    schedulesStarted = true;
 
-    // Night Post: 10:00 PM daily
-    cron.schedule('0 22 * * *', () => sendDailyImage('Night'));
-    
-    console.log('📅 Timers armed: Morning (8:00 AM) and Night (10:00 PM) daily.');
+    cron.schedule('0 8 * * *', () => sendScheduledImage('morning'), {
+        timezone,
+        noOverlap: true,
+    });
+    cron.schedule('0 22 * * *', () => sendScheduledImage('evening'), {
+        timezone,
+        noOverlap: true,
+    });
 }
 
-client.initialize();
+async function sendScheduledImage(slot) {
+    try {
+        await sendDailyImage(slot);
+    } catch (error) {
+        console.error(`Failed to post the ${slot} image:`, error);
+    }
+}
+
+client.initialize().catch((error) => {
+    console.error('WhatsApp client initialization failed:', error);
+    process.exitCode = 1;
+});

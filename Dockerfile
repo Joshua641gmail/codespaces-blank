@@ -11,6 +11,9 @@ COPY package*.json ./
 # Install project modules cleanly
 RUN npm ci
 
+# Keep WhatsApp's login state on a mountable path owned by the runtime user.
+RUN mkdir -p /data && chown pptruser:pptruser /data
+
 # Copy the rest of the script application files into place
 COPY --chown=pptruser:pptruser . .
 

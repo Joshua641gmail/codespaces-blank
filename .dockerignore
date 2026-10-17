@@ -1,0 +1,7 @@
+.env
+.git/
+.wwebjs_auth/
+.wwebjs_cache/
+google-credentials.json
+node_modules/
+npm-debug.log*

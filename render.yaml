@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: whatsapp-drive-poster
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    disk:
+      name: whatsapp-auth
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_DRIVE_FOLDER_ID
+        sync: false
+      - key: WHATSAPP_GROUP_IDS
+        sync: false
+      - key: SCHEDULE_TIMEZONE
+        value: Africa/Nairobi
+      - key: WHATSAPP_AUTH_PATH
+        value: /data/.wwebjs_auth

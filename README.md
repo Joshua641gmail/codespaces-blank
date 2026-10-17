@@ -18,7 +18,17 @@ npm test
 npm start
 ```
 
-The included Dockerfile builds a container. A deploy target must provide an always-running process and persistent storage for `WHATSAPP_AUTH_PATH`; free hosting tiers may sleep, lose storage, or impose limits, so they cannot guarantee 24/7 delivery. Deployment also requires configuring secrets and completing the WhatsApp QR login on the chosen host.
+## Deploy on Render
+
+1. Before connecting a repository to Render, rotate the Google service-account key, unlink any WhatsApp session that was exposed, and remove the credentials and session files from the repository and its Git history. These files were already tracked before this setup; ignore rules do not remove them from earlier commits. Do not deploy the repository until this cleanup is complete.
+2. Push the cleaned repository to GitHub and create a **Blueprint** on Render, selecting that repository and its `render.yaml` file.
+3. Enter the Google service-account JSON, Drive folder ID, and comma-separated WhatsApp group IDs when Render prompts for the Blueprint's unsynced environment variables. Keep the JSON in Render's secret environment-variable setting, not in the repository.
+4. Deploy the worker. In Render logs, scan the displayed WhatsApp QR code using the WhatsApp account authorized by the group admins. The QR login data is stored on the `/data` persistent disk and survives worker restarts.
+5. Confirm the worker logs report the WhatsApp connection and scheduled times. Check the first scheduled post in both groups.
+
+The Blueprint uses a paid always-on background worker and a 1 GB persistent disk: Render free instances do not support background workers or persistent disks. A free web service is not a substitute: it can spin down and loses its filesystem state, so it cannot reliably maintain WhatsApp login or deliver these scheduled posts. See [Render's free instance limits](https://render.com/docs/free), [background workers](https://render.com/docs/background-workers), and [persistent disk requirements](https://render.com/docs/disks).
+
+The included Dockerfile builds the service image. If deploying outside Render, the host must provide an always-running process and persistent storage for `WHATSAPP_AUTH_PATH`.
 
 This uses `whatsapp-web.js` (WhatsApp Web automation), not the official WhatsApp Business API. It may break when WhatsApp changes its web client and may carry account restriction risk. Only use it for groups whose admins have approved the scheduled posts.
 

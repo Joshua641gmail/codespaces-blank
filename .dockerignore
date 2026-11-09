@@ -1,0 +1,6 @@
+.env
+.git/
+.baileys_auth/
+google-credentials.json
+node_modules/
+npm-debug.log*

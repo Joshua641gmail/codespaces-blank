@@ -8,6 +8,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const { auth, drive } = require('@googleapis/drive');
 const cron = require('node-cron');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -99,6 +100,17 @@ function savePaused(value) {
 let paused = loadPaused();
 let lastResult = 'none yet';
 
+// Groups the account cannot post to right now (removed, admins-only, send errors), shown in !status.
+const groupProblems = new Map();
+const groupCheckCache = new Map();
+const GROUP_CHECK_TTL_MS = 20 * 60 * 1000;
+
+function setPaused(value) {
+    paused = value;
+    savePaused(value);
+    console.log(value ? 'Posting paused.' : 'Posting resumed.');
+}
+
 // Log problems instead of letting one stray error crash the service (Railway shows a crash as a failed deploy).
 process.on('unhandledRejection', (error) => console.error('Unhandled rejection:', error));
 process.on('uncaughtException', (error) => console.error('Uncaught exception:', error));
@@ -111,10 +123,38 @@ function randomBetween(min, max) {
     return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+// Optional control link that does not depend on WhatsApp receiving your messages.
+// Set ADMIN_TOKEN (12+ characters) in Railway, then open https://<your-app>/pause?token=... on your phone.
+const adminToken = process.env.ADMIN_TOKEN?.trim();
+if (adminToken && adminToken.length < 12) {
+    console.warn('ADMIN_TOKEN is shorter than 12 characters; the /pause, /resume and /status links are disabled.');
+}
+
+function tokenMatches(candidate) {
+    if (!adminToken || adminToken.length < 12 || !candidate) {
+        return false;
+    }
+    const a = crypto.createHash('sha256').update(candidate).digest();
+    const b = crypto.createHash('sha256').update(adminToken).digest();
+    return crypto.timingSafeEqual(a, b);
+}
+
 const server = http.createServer((request, response) => {
-    if (request.method === 'GET' && request.url === '/health') {
+    const url = new URL(request.url || '/', 'http://localhost');
+    if (request.method === 'GET' && url.pathname === '/health') {
         response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         response.end(JSON.stringify({ status: 'ok', whatsapp: whatsappStatus, paused, lastResult }));
+        return;
+    }
+
+    if (request.method === 'GET' && ['/pause', '/resume', '/status'].includes(url.pathname) && tokenMatches(url.searchParams.get('token'))) {
+        if (url.pathname === '/pause') {
+            setPaused(true);
+        } else if (url.pathname === '/resume') {
+            setPaused(false);
+        }
+        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end(statusText());
         return;
     }
 
@@ -135,12 +175,6 @@ function messageText(message) {
     return (content?.conversation || content?.extendedTextMessage?.text || '').trim();
 }
 
-function ownChatIds(socket) {
-    return [socket.user?.id, socket.user?.lid]
-        .filter(Boolean)
-        .map((id) => jidNormalizedUser(id));
-}
-
 function statusText() {
     const plan = loadPlan();
     const lines = [
@@ -148,6 +182,12 @@ function statusText() {
         `WhatsApp: ${whatsappStatus}`,
         `Last result: ${lastResult}`,
     ];
+    if (groupProblems.size > 0) {
+        lines.push('Groups being skipped:');
+        for (const [groupId, reason] of groupProblems) {
+            lines.push(`${groupId.slice(0, 12)}... - ${reason}`);
+        }
+    }
     if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
         lines.push(`Today (${timezone}):`);
         for (const entry of plan.entries) {
@@ -159,43 +199,49 @@ function statusText() {
     return lines.join('\n');
 }
 
-// Commands: send !pause, !resume or !status to yourself ("Message yourself" chat).
+// Commands: send !pause, !resume or !status from the linked phone, ideally in your
+// "Message yourself" chat. They are accepted only from your own account (never from other
+// people), and the reply always goes to your own chat so nobody else sees it.
 // !getid works from the linked account inside a group.
+const COMMAND_PATTERN = /^(?:!getid|getid!|!pause|!resume|!status)$/i;
+
 async function handleCommand(socket, message) {
+    const chatId = message.key.remoteJid;
+    const body = messageText(message);
+    if (!COMMAND_PATTERN.test(body)) {
+        return;
+    }
+    console.log(`Command "${body}" seen (fromMe=${Boolean(message.key.fromMe)}, chat=${chatId?.split('@')[1] || 'unknown'}).`);
     if (!message.key.fromMe) {
         return;
     }
-    const age = Date.now() / 1000 - Number(message.messageTimestamp || 0);
-    if (age > COMMAND_MAX_AGE_SECONDS) {
+    const timestamp = message.messageTimestamp?.toNumber?.() ?? Number(message.messageTimestamp || 0);
+    if (Date.now() / 1000 - timestamp > COMMAND_MAX_AGE_SECONDS) {
+        console.log('Ignoring an old command.');
         return;
     }
 
-    const chatId = message.key.remoteJid;
-    const body = messageText(message);
-
     try {
-        if (chatId?.endsWith('@g.us') && /^(?:!getid|getid!)$/i.test(body)) {
-            console.log('Received WhatsApp group-ID request.');
-            await socket.sendMessage(chatId, { text: `Group ID: ${chatId}` });
+        const command = body.toLowerCase();
+        if (command === '!getid' || command === 'getid!') {
+            if (chatId?.endsWith('@g.us')) {
+                await socket.sendMessage(chatId, { text: `Group ID: ${chatId}` });
+            }
+            return;
+        }
+        if (!chatId || chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) {
             return;
         }
 
-        if (!ownChatIds(socket).includes(jidNormalizedUser(chatId || ''))) {
-            return;
-        }
-        const command = body.toLowerCase();
+        const ownChat = jidNormalizedUser(socket.user?.id || chatId);
         if (command === '!pause') {
-            paused = true;
-            savePaused(true);
-            console.log('Posting paused by command.');
-            await socket.sendMessage(chatId, { text: 'Posting paused. Send !resume to continue.' });
+            setPaused(true);
+            await socket.sendMessage(ownChat, { text: 'Posting paused. Send !resume to continue.' });
         } else if (command === '!resume') {
-            paused = false;
-            savePaused(false);
-            console.log('Posting resumed by command.');
-            await socket.sendMessage(chatId, { text: 'Posting resumed.' });
+            setPaused(false);
+            await socket.sendMessage(ownChat, { text: 'Posting resumed.' });
         } else if (command === '!status') {
-            await socket.sendMessage(chatId, { text: statusText() });
+            await socket.sendMessage(ownChat, { text: statusText() });
         }
     } catch (error) {
         console.error('Failed to handle a command:', error);
@@ -241,8 +287,11 @@ async function connectWhatsApp() {
     let pairingCodeIssued = false;
 
     socket.ev.on('creds.update', saveCreds);
-    socket.ev.on('messages.upsert', async ({ messages }) => {
+    socket.ev.on('messages.upsert', async ({ messages, type }) => {
         for (const message of messages) {
+            if (message.key.fromMe && !message.key.remoteJid?.endsWith('@g.us') && !message.key.remoteJid?.endsWith('@broadcast')) {
+                console.log(`Own one-to-one message received (upsert ${type}, ${message.message ? 'readable' : 'could not be read'}).`);
+            }
             await handleCommand(socket, message);
         }
     });
@@ -343,14 +392,74 @@ function requireConnectedSocket(action) {
     return socket;
 }
 
+// Works out whether this account can post in a group. Only definite problems skip a
+// group (it was removed, or only admins may post and we are not one); anything unclear
+// is treated as "try sending".
+async function groupBlocker(socket, groupId) {
+    const cached = groupCheckCache.get(groupId);
+    if (cached && Date.now() - cached.at < GROUP_CHECK_TTL_MS) {
+        return cached.problem;
+    }
+
+    let problem;
+    try {
+        const metadata = await socket.groupMetadata(groupId);
+        const mine = [socket.user?.id, socket.user?.lid].filter(Boolean).map((id) => jidNormalizedUser(id));
+        const self = metadata.participants?.find((participant) => (
+            [participant.id, participant.lid, participant.phoneNumber]
+                .filter(Boolean)
+                .some((id) => mine.includes(jidNormalizedUser(id)))
+        ));
+        if (metadata.announce && self && !self.admin) {
+            problem = 'only admins can post in this group';
+        }
+    } catch (error) {
+        const code = error?.output?.statusCode ?? error?.data;
+        if ([403, 404].includes(code) || /forbidden|not-authorized|item-not-found/i.test(String(error?.message))) {
+            problem = 'removed from this group or it no longer exists';
+        }
+    }
+
+    groupCheckCache.set(groupId, { at: Date.now(), problem });
+    return problem;
+}
+
 // Sends to every group with a random pause in between, so groups are not hit in one burst.
+// A group that cannot be posted to is skipped and the others still get the post.
 async function sendToGroups(socket, buildContent) {
-    for (const [index, groupId] of groupIds.entries()) {
-        if (index > 0) {
+    const result = { sent: 0, skipped: 0, failed: 0 };
+    let attempted = 0;
+
+    for (const groupId of groupIds) {
+        const problem = await groupBlocker(socket, groupId);
+        if (problem) {
+            groupProblems.set(groupId, problem);
+            console.warn(`Skipping group ${groupId}: ${problem}.`);
+            result.skipped += 1;
+            continue;
+        }
+
+        if (attempted > 0) {
             await sleep(randomBetween(20_000, 90_000));
         }
-        await socket.sendMessage(groupId, buildContent());
+        attempted += 1;
+        try {
+            await socket.sendMessage(groupId, buildContent());
+            groupProblems.delete(groupId);
+            result.sent += 1;
+        } catch (error) {
+            groupProblems.set(groupId, `send failed: ${error.message}`);
+            console.error(`Could not post to group ${groupId}:`, error);
+            result.failed += 1;
+        }
     }
+
+    return result;
+}
+
+function describeResult(result) {
+    const total = result.sent + result.skipped + result.failed;
+    return `${result.sent}/${total} group(s)`;
 }
 
 async function sendDailyImage(entry, dayNumber) {
@@ -368,21 +477,23 @@ async function sendDailyImage(entry, dayNumber) {
     const socket = requireConnectedSocket('scheduled image');
     const media = Buffer.from(response.data);
     const caption = captionFor(weekday, dayNumber, entry.variant);
-    await sendToGroups(socket, () => ({
+    const result = await sendToGroups(socket, () => ({
         image: media,
         mimetype: image.mimeType,
         caption,
     }));
 
-    console.log(`Posted ${image.name} with a caption to ${groupIds.length} group(s) (${entry.id}).`);
+    console.log(`Posted ${image.name} with a caption to ${describeResult(result)} (${entry.id}).`);
+    return result;
 }
 
 async function sendDailyMessage(entry, dayNumber) {
     const socket = requireConnectedSocket('scheduled message');
     const text = messageFor(dayNumber, entry.variant);
-    await sendToGroups(socket, () => ({ text }));
+    const result = await sendToGroups(socket, () => ({ text }));
 
-    console.log(`Posted the message to ${groupIds.length} group(s) (${entry.id}).`);
+    console.log(`Posted the message to ${describeResult(result)} (${entry.id}).`);
+    return result;
 }
 
 async function sendCountdownMessage() {
@@ -393,9 +504,10 @@ async function sendCountdownMessage() {
 
     const socket = requireConnectedSocket('countdown message');
     const text = countdownMessage(days);
-    await sendToGroups(socket, () => ({ text }));
+    const result = await sendToGroups(socket, () => ({ text }));
 
-    console.log(`Posted the ${days}-day conference countdown to ${groupIds.length} group(s).`);
+    console.log(`Posted the ${days}-day conference countdown to ${describeResult(result)}.`);
+    return result;
 }
 
 function loadPlan() {
@@ -459,15 +571,25 @@ async function runEntry(plan, entry) {
 
     const dayNumber = dateInTimeZone(new Date(), timezone) / (24 * 60 * 60 * 1000);
     try {
+        let result;
         if (entry.type === 'image') {
-            await sendDailyImage(entry, dayNumber);
+            result = await sendDailyImage(entry, dayNumber);
         } else if (entry.type === 'countdown') {
-            await sendCountdownMessage();
+            result = await sendCountdownMessage();
         } else {
-            await sendDailyMessage(entry, dayNumber);
+            result = await sendDailyMessage(entry, dayNumber);
         }
-        entry.status = 'done';
-        lastResult = `${entry.id} posted at ${new Date().toLocaleTimeString('en', { timeZone: timezone })}`;
+
+        if (!result) {
+            entry.status = 'skipped (nothing to post)';
+        } else if (result.sent > 0) {
+            entry.status = result.skipped + result.failed === 0
+                ? 'done'
+                : `done (${describeResult(result)})`;
+        } else {
+            entry.status = 'failed (no group could be posted to)';
+        }
+        lastResult = `${entry.id} ${entry.status} at ${new Date().toLocaleTimeString('en', { timeZone: timezone })}`;
     } catch (error) {
         // Not retried: a retry could produce a duplicate or an extra burst.
         entry.status = 'failed';

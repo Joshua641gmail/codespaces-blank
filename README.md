@@ -17,7 +17,7 @@ Images use `MONDAY.png` … `FRIDAY.png` from the configured Google Drive folder
 
 ## Pause and resume without redeploying
 
-Open your own "Message yourself" chat on the linked phone and send:
+On the linked phone, open your own "Message yourself" chat (any one-to-one chat of yours also works) and send:
 
 | Command | Effect |
 |---|---|
@@ -26,6 +26,20 @@ Open your own "Message yourself" chat on the linked phone and send:
 | `!status` | Replies with paused/active, WhatsApp status, the last result and today's plan. |
 
 The pause state is saved on the volume, so it survives restarts. `!getid` still works inside a group, but only when sent from the linked account. The `/health` endpoint also shows `paused` and `lastResult`.
+
+### Pause from a link (more reliable than commands)
+
+Set `ADMIN_TOKEN` in Railway to a private value of 12+ characters, then open these on your phone (replace the domain with your Railway one):
+
+- `https://YOUR-APP.up.railway.app/pause?token=YOUR_TOKEN`
+- `https://YOUR-APP.up.railway.app/resume?token=YOUR_TOKEN`
+- `https://YOUR-APP.up.railway.app/status?token=YOUR_TOKEN`
+
+This works even if WhatsApp does not deliver your command messages. Anyone with the link can pause the bot, so keep the token private. Without `ADMIN_TOKEN` these links do not exist.
+
+## Groups that cannot be posted to
+
+Before each post the bot checks every group. A group is skipped (and the other groups still get the post) when the account was removed from it, it no longer exists, or only admins can post and the account is not an admin. A failed send to one group never stops the rest. Skipped groups appear in `!status` / `/status` and are re-checked automatically (every 20 minutes at most), so they resume by themselves once the account can post again.
 
 ## Captions and messages
 

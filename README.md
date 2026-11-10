@@ -43,7 +43,18 @@ Before each post the bot checks every group. A group is skipped (and the other g
 
 ## Captions and messages
 
-All wording lives in `lib/content.js`. Captions are built from 10 openers × 10 closers (100 variants, `{Day}` becomes the weekday name) and messages from 12 leads × 6 tails × 2 layouts (144 variants), each containing the bold `*ALEX FOR GUILD*`. The rotation walks through all of them before repeating, so nothing repeats for at least 30 days. Edit the lists freely; `npm test` checks that the pools are still big enough. Review the default wording before deploying.
+All wording lives in `lib/content.js`. Every post (image caption or standalone message) is built the same way:
+
+```
+Tuesday update
+
+<one of the 20 messages>
+
+##MUTSINZI ALEX##
+##GUILD ASPIRANT##
+```
+
+The first line rotates between a few headers ("Tuesday update", "Tuesday encouragement", "Happy Tuesday" ...). Captions and messages share one pool of 20 messages, and a message is not used again until all 20 have been used once; then a new shuffled round starts, and its first message is never the one just used. The used list is saved in `state.json` on the volume, and a message only counts as used once it has actually reached a group. The countdown post is separate and unchanged.
 
 ## Configure
 

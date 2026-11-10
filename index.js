@@ -16,8 +16,8 @@ const pino = require('pino');
 require('dotenv').config();
 const { isWeekdayFor, selectWeekdayImage, weekdayNameFor } = require('./lib/image-selection');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
-const { countdownDaysFor, countdownMessage, dateInTimeZone } = require('./lib/countdown-message');
-const { captionFor, messageFor } = require('./lib/content');
+const { countdownDaysFor, countdownMessage } = require('./lib/countdown-message');
+const { drawVariant, formatPost } = require('./lib/content');
 
 const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -79,22 +79,27 @@ const scheduledEntries = new Set();
 // Commands older than this are ignored, so replayed chat history never pauses or resumes anything.
 const COMMAND_MAX_AGE_SECONDS = 120;
 
-// Pause state is saved to disk so it survives restarts and redeploys.
-function loadPaused() {
+// Small saved state (pause flag and which wording has been used), kept on the volume so it
+// survives restarts and redeploys.
+function loadState() {
     try {
-        return JSON.parse(fs.readFileSync(statePath, 'utf8')).paused === true;
+        return JSON.parse(fs.readFileSync(statePath, 'utf8'));
     } catch {
-        return false;
+        return {};
     }
 }
 
-function savePaused(value) {
+function saveState(patch) {
     try {
         fs.mkdirSync(path.dirname(statePath), { recursive: true });
-        fs.writeFileSync(statePath, JSON.stringify({ paused: value }));
+        fs.writeFileSync(statePath, JSON.stringify({ ...loadState(), ...patch }));
     } catch (error) {
-        console.error('Could not save the pause state:', error);
+        console.error('Could not save the state file:', error);
     }
+}
+
+function loadPaused() {
+    return loadState().paused === true;
 }
 
 let paused = loadPaused();
@@ -107,7 +112,7 @@ const GROUP_CHECK_TTL_MS = 20 * 60 * 1000;
 
 function setPaused(value) {
     paused = value;
-    savePaused(value);
+    saveState({ paused: value });
     console.log(value ? 'Posting paused.' : 'Posting resumed.');
 }
 
@@ -462,7 +467,7 @@ function describeResult(result) {
     return `${result.sent}/${total} group(s)`;
 }
 
-async function sendDailyImage(entry, dayNumber) {
+async function sendDailyImage(entry) {
     const weekday = weekdayNameFor(new Date(), timezone);
     const image = selectWeekdayImage(await listImagesInFolder(), weekday);
     if (!image) {
@@ -476,21 +481,30 @@ async function sendDailyImage(entry, dayNumber) {
     );
     const socket = requireConnectedSocket('scheduled image');
     const media = Buffer.from(response.data);
-    const caption = captionFor(weekday, dayNumber, entry.variant);
+    const wording = drawVariant(loadState().wording);
+    const caption = formatPost(weekday, wording.index);
     const result = await sendToGroups(socket, () => ({
         image: media,
         mimetype: image.mimeType,
         caption,
     }));
+    // Only mark the wording as used when it actually reached a group.
+    if (result.sent > 0) {
+        saveState({ wording: wording.state });
+    }
 
     console.log(`Posted ${image.name} with a caption to ${describeResult(result)} (${entry.id}).`);
     return result;
 }
 
-async function sendDailyMessage(entry, dayNumber) {
+async function sendDailyMessage(entry) {
     const socket = requireConnectedSocket('scheduled message');
-    const text = messageFor(dayNumber, entry.variant);
+    const wording = drawVariant(loadState().wording);
+    const text = formatPost(weekdayNameFor(new Date(), timezone), wording.index);
     const result = await sendToGroups(socket, () => ({ text }));
+    if (result.sent > 0) {
+        saveState({ wording: wording.state });
+    }
 
     console.log(`Posted the message to ${describeResult(result)} (${entry.id}).`);
     return result;
@@ -569,15 +583,14 @@ async function runEntry(plan, entry) {
         return;
     }
 
-    const dayNumber = dateInTimeZone(new Date(), timezone) / (24 * 60 * 60 * 1000);
     try {
         let result;
         if (entry.type === 'image') {
-            result = await sendDailyImage(entry, dayNumber);
+            result = await sendDailyImage(entry);
         } else if (entry.type === 'countdown') {
             result = await sendCountdownMessage();
         } else {
-            result = await sendDailyMessage(entry, dayNumber);
+            result = await sendDailyMessage(entry);
         }
 
         if (!result) {

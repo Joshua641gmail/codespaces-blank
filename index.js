@@ -14,18 +14,21 @@ const http = require('node:http');
 const path = require('node:path');
 const pino = require('pino');
 require('dotenv').config();
-const { isWeekdayFor, selectWeekdayImage, weekdayNameFor } = require('./lib/image-selection');
+const { isPostingDay, selectImage } = require('./lib/image-selection');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
-const { countdownDaysFor, countdownMessage } = require('./lib/countdown-message');
 const { drawVariant, formatPost } = require('./lib/content');
 
 const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-const groupIds = (process.env.WHATSAPP_GROUP_IDS || '')
+// Groups from the Railway variable. Groups added or removed with !addgroup / !removegroup are
+// kept in state.json on the volume and applied on top of this list (see getGroupIds).
+const envGroupIds = (process.env.WHATSAPP_GROUP_IDS || '')
     .split(',')
     .map((groupId) => groupId.trim())
     .filter(Boolean);
 const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_CREDS_JSON;
+// Last day posts are sent (inclusive), as YYYY-MM-DD in the schedule timezone.
+const lastPostDate = process.env.LAST_POST_DATE?.trim() || '2026-12-05';
 const sessionPath = process.env.WHATSAPP_AUTH_PATH || path.join(process.cwd(), '.baileys_auth');
 const pairingPhoneNumber = process.env.WHATSAPP_PHONE_NUMBER?.trim();
 
@@ -38,11 +41,15 @@ if (!serviceAccountJson) {
 if (!pairingPhoneNumber) {
     throw new Error('WHATSAPP_PHONE_NUMBER must be set to link WhatsApp by phone number.');
 }
-if (groupIds.some((groupId) => !groupId.endsWith('@g.us'))) {
+if (envGroupIds.some((groupId) => !groupId.endsWith('@g.us'))) {
     throw new Error('WHATSAPP_GROUP_IDS must contain WhatsApp group IDs ending in @g.us.');
 }
 if (!/^[1-9]\d{6,14}$/.test(pairingPhoneNumber)) {
     throw new Error('WHATSAPP_PHONE_NUMBER must use international format with digits only, including the country code.');
+}
+
+if (!/^\d{4}-\d{2}-\d{2}$/.test(lastPostDate)) {
+    throw new Error('LAST_POST_DATE must look like 2026-12-05.');
 }
 
 try {
@@ -73,6 +80,7 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
 // A post that is more than this late (for example after a long outage) is skipped, not sent in a rush.
 const MAX_LATE_SECONDS = 30 * 60;
+const PLAN_VERSION = 2;
 const planPath = path.join(sessionPath, 'daily-plan.json');
 const statePath = path.join(sessionPath, 'state.json');
 const scheduledEntries = new Set();
@@ -110,6 +118,63 @@ const groupProblems = new Map();
 const groupCheckCache = new Map();
 const GROUP_CHECK_TTL_MS = 20 * 60 * 1000;
 
+const GROUP_ID_PATTERN = /^[\d-]+@g\.us$/;
+
+// Groups to post to: the Railway list plus groups added with !addgroup, minus removed ones.
+function getGroupIds() {
+    const state = loadState();
+    const removed = new Set(state.removedGroups || []);
+    return [...new Set([...envGroupIds, ...(state.addedGroups || [])])].filter((id) => !removed.has(id));
+}
+
+function changeGroupList(groupId, action) {
+    const state = loadState();
+    const added = new Set(state.addedGroups || []);
+    const removed = new Set(state.removedGroups || []);
+    const wasIn = getGroupIds().includes(groupId);
+    if (action === 'add') {
+        added.add(groupId);
+        removed.delete(groupId);
+    } else {
+        added.delete(groupId);
+        removed.add(groupId);
+    }
+    saveState({ addedGroups: [...added], removedGroups: [...removed] });
+    groupCheckCache.delete(groupId);
+    groupProblems.delete(groupId);
+    return { wasIn, count: getGroupIds().length };
+}
+
+async function groupName(socket, groupId) {
+    try {
+        return (await socket?.groupMetadata(groupId))?.subject || groupId;
+    } catch {
+        return groupId;
+    }
+}
+
+async function groupsText() {
+    const ids = getGroupIds();
+    if (ids.length === 0) {
+        return 'No groups yet. Send !addgroup inside a group to add it.';
+    }
+    const socket = whatsappStatus === 'connected' ? whatsappSocket : undefined;
+    const names = await Promise.all(ids.map((id) => groupName(socket, id)));
+    return `Posting to ${ids.length} group(s):\n${names.map((name, index) => `${index + 1}. ${name}`).join('\n')}`;
+}
+
+async function updateGroup(groupId, action) {
+    const socket = whatsappStatus === 'connected' ? whatsappSocket : undefined;
+    const name = await groupName(socket, groupId);
+    const { wasIn, count } = changeGroupList(groupId, action);
+    if (action === 'add') {
+        console.log(`Group added: ${name}.`);
+        return wasIn ? `Already in the list: ${name}. Posting to ${count} group(s).` : `Added: ${name}. Now posting to ${count} group(s).`;
+    }
+    console.log(`Group removed: ${name}.`);
+    return wasIn ? `Removed: ${name}. Now posting to ${count} group(s).` : `Was not in the list: ${name}. Posting to ${count} group(s).`;
+}
+
 function setPaused(value) {
     paused = value;
     saveState({ paused: value });
@@ -144,27 +209,46 @@ function tokenMatches(candidate) {
     return crypto.timingSafeEqual(a, b);
 }
 
-const server = http.createServer((request, response) => {
+const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://localhost');
+    const send = (status, body, type = 'text/plain') => {
+        response.writeHead(status, { 'content-type': `${type}; charset=utf-8` });
+        response.end(body);
+    };
+
     if (request.method === 'GET' && url.pathname === '/health') {
-        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        response.end(JSON.stringify({ status: 'ok', whatsapp: whatsappStatus, paused, lastResult }));
+        send(200, JSON.stringify({ status: 'ok', whatsapp: whatsappStatus, paused, lastResult }), 'application/json');
         return;
     }
 
-    if (request.method === 'GET' && ['/pause', '/resume', '/status'].includes(url.pathname) && tokenMatches(url.searchParams.get('token'))) {
-        if (url.pathname === '/pause') {
-            setPaused(true);
-        } else if (url.pathname === '/resume') {
-            setPaused(false);
+    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/addgroup', '/removegroup'];
+    if (request.method !== 'GET' || !adminPaths.includes(url.pathname) || !tokenMatches(url.searchParams.get('token'))) {
+        send(404, 'not found');
+        return;
+    }
+
+    try {
+        if (url.pathname === '/groups') {
+            send(200, await groupsText());
+        } else if (url.pathname === '/addgroup' || url.pathname === '/removegroup') {
+            const id = (url.searchParams.get('id') || '').trim();
+            if (!GROUP_ID_PATTERN.test(id)) {
+                send(400, 'Add id=<group id ending in @g.us> to the link.');
+                return;
+            }
+            send(200, await updateGroup(id, url.pathname === '/addgroup' ? 'add' : 'remove'));
+        } else {
+            if (url.pathname === '/pause') {
+                setPaused(true);
+            } else if (url.pathname === '/resume') {
+                setPaused(false);
+            }
+            send(200, statusText());
         }
-        response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        response.end(statusText());
-        return;
+    } catch (error) {
+        console.error('Admin link failed:', error);
+        send(500, 'Something went wrong; check the logs.');
     }
-
-    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-    response.end('not found');
 });
 
 server.on('error', (error) => {
@@ -186,6 +270,7 @@ function statusText() {
         `Posting: ${paused ? 'PAUSED' : 'ACTIVE'}`,
         `WhatsApp: ${whatsappStatus}`,
         `Last result: ${lastResult}`,
+        `Groups: ${getGroupIds().length} (last post day: ${lastPostDate})`,
     ];
     if (groupProblems.size > 0) {
         lines.push('Groups being skipped:');
@@ -196,7 +281,7 @@ function statusText() {
     if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
         lines.push(`Today (${timezone}):`);
         for (const entry of plan.entries) {
-            lines.push(`${formatSeconds(entry.atSecond)} ${entry.type} - ${entry.status}`);
+            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} image - ${entry.status}`);
         }
     } else {
         lines.push('No posts planned for the rest of today.');
@@ -204,11 +289,14 @@ function statusText() {
     return lines.join('\n');
 }
 
-// Commands: send !pause, !resume or !status from the linked phone, ideally in your
-// "Message yourself" chat. They are accepted only from your own account (never from other
-// people), and the reply always goes to your own chat so nobody else sees it.
-// !getid works from the linked account inside a group.
-const COMMAND_PATTERN = /^(?:!getid|getid!|!pause|!resume|!status)$/i;
+// Commands, sent from the linked phone (only your own account is ever obeyed):
+//   !status, !pause, !resume   - control posting
+//   !groups                    - list the groups being posted to
+//   !addgroup / !removegroup   - send inside a group to add or remove it
+//   !getid                     - inside a group, replies with the group ID
+// Replies always go to your own "Message yourself" chat, so nobody else sees them. A command
+// sent inside a group is deleted from that group afterwards.
+const COMMAND_PATTERN = /^(?:!getid|getid!|!pause|!resume|!status|!groups|!addgroup|!removegroup)$/i;
 
 async function handleCommand(socket, message) {
     const chatId = message.key.remoteJid;
@@ -228,25 +316,42 @@ async function handleCommand(socket, message) {
 
     try {
         const command = body.toLowerCase();
+        const inGroup = Boolean(chatId?.endsWith('@g.us'));
         if (command === '!getid' || command === 'getid!') {
-            if (chatId?.endsWith('@g.us')) {
+            if (inGroup) {
                 await socket.sendMessage(chatId, { text: `Group ID: ${chatId}` });
             }
             return;
         }
-        if (!chatId || chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) {
+        if (!chatId || chatId.endsWith('@broadcast')) {
             return;
         }
 
-        const ownChat = jidNormalizedUser(socket.user?.id || chatId);
-        if (command === '!pause') {
+        let reply;
+        if (command === '!addgroup' || command === '!removegroup') {
+            reply = inGroup
+                ? await updateGroup(chatId, command === '!addgroup' ? 'add' : 'remove')
+                : `Send ${command} inside the group you want to ${command === '!addgroup' ? 'add' : 'remove'}.`;
+        } else if (command === '!pause') {
             setPaused(true);
-            await socket.sendMessage(ownChat, { text: 'Posting paused. Send !resume to continue.' });
+            reply = 'Posting paused. Send !resume to continue.';
         } else if (command === '!resume') {
             setPaused(false);
-            await socket.sendMessage(ownChat, { text: 'Posting resumed.' });
-        } else if (command === '!status') {
-            await socket.sendMessage(ownChat, { text: statusText() });
+            reply = 'Posting resumed.';
+        } else if (command === '!groups') {
+            reply = await groupsText();
+        } else {
+            reply = statusText();
+        }
+
+        await socket.sendMessage(jidNormalizedUser(socket.user?.id || chatId), { text: reply });
+
+        if (inGroup) {
+            try {
+                await socket.sendMessage(chatId, { delete: message.key });
+            } catch (error) {
+                console.warn('Could not delete the command message from the group:', error.message);
+            }
         }
     } catch (error) {
         console.error('Failed to handle a command:', error);
@@ -305,12 +410,11 @@ async function connectWhatsApp() {
             whatsappStatus = 'connected';
             reconnectAttempts = 0;
             console.log('WhatsApp client is ready.');
-            if (groupIds.length === 0) {
-                console.log('WhatsApp connected. Send !getid in each target group to retrieve its ID, then set WHATSAPP_GROUP_IDS and redeploy.');
-            } else {
-                console.log(`WhatsApp connected. Daily randomized post plan active (${timezone}).`);
-                setupSchedules();
+            if (getGroupIds().length === 0) {
+                console.log('WhatsApp connected, but no groups are set. Send !addgroup inside each target group.');
             }
+            console.log(`WhatsApp connected. Daily randomized post plan active (${timezone}, last post day ${lastPostDate}).`);
+            setupSchedules();
             return;
         }
 
@@ -435,7 +539,7 @@ async function sendToGroups(socket, buildContent) {
     const result = { sent: 0, skipped: 0, failed: 0 };
     let attempted = 0;
 
-    for (const groupId of groupIds) {
+    for (const groupId of getGroupIds()) {
         const problem = await groupBlocker(socket, groupId);
         if (problem) {
             groupProblems.set(groupId, problem);
@@ -468,11 +572,11 @@ function describeResult(result) {
 }
 
 async function sendDailyImage(entry) {
-    const weekday = weekdayNameFor(new Date(), timezone);
-    const image = selectWeekdayImage(await listImagesInFolder(), weekday);
+    const period = entry.period;
+    const image = selectImage(await listImagesInFolder(), period);
     if (!image) {
-        console.log(`Skipping ${entry.id}; ${weekday}.png was not found in the configured Drive folder.`);
-        return;
+        console.log(`Skipping ${entry.id}; ${period.toUpperCase()}.png was not found in the configured Drive folder.`);
+        return undefined;
     }
 
     const response = await driveClient.files.get(
@@ -481,8 +585,9 @@ async function sendDailyImage(entry) {
     );
     const socket = requireConnectedSocket('scheduled image');
     const media = Buffer.from(response.data);
-    const wording = drawVariant(loadState().wording);
-    const caption = formatPost(weekday, wording.index);
+    const savedWording = loadState().wording || {};
+    const wording = drawVariant(period, savedWording[period]);
+    const caption = formatPost(period, wording.index);
     const result = await sendToGroups(socket, () => ({
         image: media,
         mimetype: image.mimeType,
@@ -490,37 +595,10 @@ async function sendDailyImage(entry) {
     }));
     // Only mark the wording as used when it actually reached a group.
     if (result.sent > 0) {
-        saveState({ wording: wording.state });
+        saveState({ wording: { ...savedWording, [period]: wording.state } });
     }
 
     console.log(`Posted ${image.name} with a caption to ${describeResult(result)} (${entry.id}).`);
-    return result;
-}
-
-async function sendDailyMessage(entry) {
-    const socket = requireConnectedSocket('scheduled message');
-    const wording = drawVariant(loadState().wording);
-    const text = formatPost(weekdayNameFor(new Date(), timezone), wording.index);
-    const result = await sendToGroups(socket, () => ({ text }));
-    if (result.sent > 0) {
-        saveState({ wording: wording.state });
-    }
-
-    console.log(`Posted the message to ${describeResult(result)} (${entry.id}).`);
-    return result;
-}
-
-async function sendCountdownMessage() {
-    const days = countdownDaysFor(new Date(), timezone);
-    if (days === undefined) {
-        return;
-    }
-
-    const socket = requireConnectedSocket('countdown message');
-    const text = countdownMessage(days);
-    const result = await sendToGroups(socket, () => ({ text }));
-
-    console.log(`Posted the ${days}-day conference countdown to ${describeResult(result)}.`);
     return result;
 }
 
@@ -553,18 +631,18 @@ function ensureTodayPlan() {
     const now = new Date();
     const dateKey = localDateKeyFor(now, timezone);
     const saved = loadPlan();
-    if (saved?.dateKey === dateKey) {
+    // `version` makes sure a plan saved by an older version of this service is never reused.
+    if (saved?.version === PLAN_VERSION && saved.dateKey === dateKey) {
         return saved;
     }
 
     const entries = planDay({
-        isWeekday: isWeekdayFor(now, timezone),
-        countdownActive: countdownDaysFor(now, timezone) !== undefined,
+        isPostingDay: isPostingDay(now, timezone, dateKey, lastPostDate),
         fromSecond: localSecondsFor(now, timezone) + 120,
     }).map((entry) => ({ ...entry, status: 'pending' }));
-    const plan = { dateKey, entries };
+    const plan = { version: PLAN_VERSION, dateKey, entries };
     savePlan(plan);
-    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.type}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
+    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
     return plan;
 }
 
@@ -584,14 +662,13 @@ async function runEntry(plan, entry) {
     }
 
     try {
-        let result;
-        if (entry.type === 'image') {
-            result = await sendDailyImage(entry);
-        } else if (entry.type === 'countdown') {
-            result = await sendCountdownMessage();
-        } else {
-            result = await sendDailyMessage(entry);
+        if (getGroupIds().length === 0) {
+            entry.status = 'skipped (no groups set)';
+            lastResult = `${entry.id} skipped: no groups are set`;
+            savePlan(plan);
+            return;
         }
+        const result = await sendDailyImage(entry);
 
         if (!result) {
             entry.status = 'skipped (nothing to post)';

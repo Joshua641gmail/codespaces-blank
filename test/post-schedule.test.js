@@ -10,20 +10,33 @@ function seeded(seed) {
     };
 }
 
-test('a posting day has two morning and two evening image posts inside their windows', () => {
-    for (let seed = 1; seed <= 300; seed += 1) {
+test('a posting day has three posts per window (two regular, one ODOI) with gaps preserved', () => {
+    for (let seed = 1; seed <= 500; seed += 1) {
         const plan = planDay({ random: seeded(seed), isPostingDay: true });
-        assert.equal(plan.length, 4);
+        assert.equal(plan.length, 6);
         for (const period of ['morning', 'evening']) {
             const entries = plan.filter((entry) => entry.period === period);
-            assert.equal(entries.length, 2);
+            assert.equal(entries.length, 3);
+            assert.equal(entries.filter((entry) => entry.kind === 'odoi').length, 1);
+            assert.equal(entries.filter((entry) => entry.kind === 'regular').length, 2);
             for (const { atSecond, type } of entries) {
                 assert.equal(type, 'image');
                 assert.ok(atSecond >= WINDOWS[period].start && atSecond < WINDOWS[period].end);
             }
-            assert.ok(entries[1].atSecond - entries[0].atSecond >= MIN_GAP_SECONDS);
+            entries.slice(1).forEach((entry, index) => {
+                assert.ok(entry.atSecond - entries[index].atSecond >= MIN_GAP_SECONDS);
+            });
         }
     }
+});
+
+test('the ODOI post lands in varying positions, not always first or last', () => {
+    const positions = new Set();
+    for (let seed = 1; seed <= 100; seed += 1) {
+        const morning = planDay({ random: seeded(seed), isPostingDay: true }).filter((entry) => entry.period === 'morning');
+        positions.add(morning.findIndex((entry) => entry.kind === 'odoi'));
+    }
+    assert.deepEqual([...positions].sort(), [0, 1, 2]);
 });
 
 test('morning is 5:00-7:30 and evening is 17:00-20:00', () => {
@@ -38,7 +51,7 @@ test('plans are sorted, have unique ids and differ from day to day', () => {
     for (let seed = 1; seed <= 30; seed += 1) {
         const plan = planDay({ random: seeded(seed), isPostingDay: true });
         plan.slice(1).forEach(({ atSecond }, index) => assert.ok(atSecond >= plan[index].atSecond));
-        assert.equal(new Set(plan.map(({ id }) => id)).size, 4);
+        assert.equal(new Set(plan.map(({ id }) => id)).size, 6);
         signatures.add(plan.map(({ atSecond }) => atSecond).join(','));
     }
     assert.equal(signatures.size, 30);
@@ -51,7 +64,7 @@ test('a non-posting day has no posts', () => {
 test('a late start only plans what is left of the day', () => {
     const afternoon = planDay({ random: seeded(3), isPostingDay: true, fromSecond: 12 * 3600 });
     assert.ok(afternoon.every((entry) => entry.period === 'evening'));
-    assert.equal(afternoon.length, 2);
+    assert.equal(afternoon.length, 3);
 
     const lateEvening = planDay({ random: seeded(3), isPostingDay: true, fromSecond: 19 * 3600 + 15 * 60 });
     assert.ok(lateEvening.length <= 1);

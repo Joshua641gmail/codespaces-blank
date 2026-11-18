@@ -65,3 +65,11 @@ test('drawing does not change the saved state, and a damaged state is tolerated'
     assert.ok(damaged.index >= 0 && damaged.index < 10);
     assert.throws(() => drawVariant('noon'), /Invalid period/);
 });
+
+test('the ODOI caption is the exact fixed text', () => {
+    const { ODOI_CAPTION } = require('../lib/content');
+    assert.ok(ODOI_CAPTION.startsWith('Success is built long before the results are announced.'));
+    assert.ok(ODOI_CAPTION.endsWith('All the very best in your papers! ✨\n\nODOI JORAM'));
+    assert.equal(ODOI_CAPTION.split('\n\n').length, 5);
+    assert.ok(ODOI_CAPTION.length < 1024);
+});

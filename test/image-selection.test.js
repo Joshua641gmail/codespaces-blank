@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { isPostingDay, selectImage, weekdayNameFor } = require('../lib/image-selection');
+const { isPostingDay, selectImage, selectOdoiImage, weekdayNameFor } = require('../lib/image-selection');
 
 test('gets the weekday in the configured timezone', () => {
     assert.equal(weekdayNameFor(new Date('2026-10-19T07:30:00Z'), 'Africa/Nairobi'), 'MONDAY');
@@ -41,4 +41,17 @@ test('skips a missing image, rejects duplicates and unknown periods', () => {
         { id: 'two', name: 'EVENING.png', mimeType: 'image/png' },
     ], 'evening'), /More than one image named EVENING\.png/);
     assert.throws(() => selectImage([], 'noon'), /Invalid period: noon/);
+});
+
+test('picks only ODOI.png by exact name and image type', () => {
+    const odoi = { id: 'o', name: 'ODOI.png', mimeType: 'image/png' };
+    const files = [
+        { id: 'a', name: 'odoi.png', mimeType: 'image/png' },
+        { id: 'b', name: 'ODOI.png', mimeType: 'application/pdf' },
+        { id: 'c', name: 'MORNING.png', mimeType: 'image/png' },
+        odoi,
+    ];
+    assert.equal(selectOdoiImage(files), odoi);
+    assert.equal(selectOdoiImage([files[2]]), undefined);
+    assert.throws(() => selectOdoiImage([odoi, { ...odoi, id: 'o2' }]), /More than one image named ODOI\.png/);
 });

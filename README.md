@@ -6,10 +6,15 @@ This service runs continuously on Railway and posts **images with a caption** to
 |---|---|
 | Morning posts | 2 per day, random times between 5:00 and 7:30 AM, image `MORNING.png` |
 | Evening posts | 2 per day, random times between 5:00 and 8:00 PM, image `EVENING.png` |
-| Minimum gap between two posts in the same window | 1 hour |
+| ODOI posts | 1 in each window (so 2 per day), image `ODOI.png`, fixed caption (see below), at its own random time mixed in with the other posts |
+| Minimum gap between any two posts in the same window (ODOI included) | 1 hour |
 | Several groups | 20-90 s random pause between groups |
 
-The images are read from the configured Google Drive folder and are strictly named `MORNING.png` and `EVENING.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
+The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png` and `ODOI.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
+
+## ODOI post
+
+The `ODOI.png` post is sent exactly like the others (same random scheduling, 1-hour gap, 20-90 s pauses between groups, lateness check, restart resume) but its caption is a fixed message from `lib/content.js` (`ODOI_CAPTION`), with no greeting or signature and no rotation. Which of the three slots in a window is the ODOI one is random each day. If a late start leaves room for fewer posts, the day is planned with fewer posts. `!status` marks it as `ODOI image`.
 
 ## Wording
 

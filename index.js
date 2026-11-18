@@ -14,9 +14,9 @@ const http = require('node:http');
 const path = require('node:path');
 const pino = require('pino');
 require('dotenv').config();
-const { isPostingDay, selectImage } = require('./lib/image-selection');
+const { ODOI_IMAGE_NAME, isPostingDay, selectImage, selectOdoiImage } = require('./lib/image-selection');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
-const { drawVariant, formatPost } = require('./lib/content');
+const { ODOI_CAPTION, drawVariant, formatPost } = require('./lib/content');
 
 const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -80,7 +80,7 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
 // A post that is more than this late (for example after a long outage) is skipped, not sent in a rush.
 const MAX_LATE_SECONDS = 30 * 60;
-const PLAN_VERSION = 2;
+const PLAN_VERSION = 3;
 const planPath = path.join(sessionPath, 'daily-plan.json');
 const statePath = path.join(sessionPath, 'state.json');
 const scheduledEntries = new Set();
@@ -281,7 +281,7 @@ function statusText() {
     if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
         lines.push(`Today (${timezone}):`);
         for (const entry of plan.entries) {
-            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} image - ${entry.status}`);
+            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} ${entry.kind === 'odoi' ? 'ODOI image' : 'image'} - ${entry.status}`);
         }
     } else {
         lines.push('No posts planned for the rest of today.');
@@ -573,9 +573,12 @@ function describeResult(result) {
 
 async function sendDailyImage(entry) {
     const period = entry.period;
-    const image = selectImage(await listImagesInFolder(), period);
+    const isOdoi = entry.kind === 'odoi';
+    const files = await listImagesInFolder();
+    const image = isOdoi ? selectOdoiImage(files) : selectImage(files, period);
     if (!image) {
-        console.log(`Skipping ${entry.id}; ${period.toUpperCase()}.png was not found in the configured Drive folder.`);
+        const missing = isOdoi ? ODOI_IMAGE_NAME : `${period.toUpperCase()}.png`;
+        console.log(`Skipping ${entry.id}; ${missing} was not found in the configured Drive folder.`);
         return undefined;
     }
 
@@ -585,16 +588,22 @@ async function sendDailyImage(entry) {
     );
     const socket = requireConnectedSocket('scheduled image');
     const media = Buffer.from(response.data);
+
+    // The ODOI post uses its fixed caption and does not touch the rotating wording.
+    let caption = ODOI_CAPTION;
+    let wording;
     const savedWording = loadState().wording || {};
-    const wording = drawVariant(period, savedWording[period]);
-    const caption = formatPost(period, wording.index);
+    if (!isOdoi) {
+        wording = drawVariant(period, savedWording[period]);
+        caption = formatPost(period, wording.index);
+    }
     const result = await sendToGroups(socket, () => ({
         image: media,
         mimetype: image.mimeType,
         caption,
     }));
     // Only mark the wording as used when it actually reached a group.
-    if (result.sent > 0) {
+    if (wording && result.sent > 0) {
         saveState({ wording: { ...savedWording, [period]: wording.state } });
     }
 
@@ -642,7 +651,7 @@ function ensureTodayPlan() {
     }).map((entry) => ({ ...entry, status: 'pending' }));
     const plan = { version: PLAN_VERSION, dateKey, entries };
     savePlan(plan);
-    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
+    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}${entry.kind === 'odoi' ? '(odoi)' : ''}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
     return plan;
 }
 

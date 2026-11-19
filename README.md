@@ -6,15 +6,16 @@ This service runs continuously on Railway and posts **images with a caption** to
 |---|---|
 | Morning posts | 2 per day, random times between 5:00 and 7:30 AM, image `MORNING.png` |
 | Evening posts | 2 per day, random times between 5:00 and 8:00 PM, image `EVENING.png` |
-| ODOI posts | 1 in each window (so 2 per day), image `ODOI.png`, fixed caption (see below), at its own random time mixed in with the other posts |
-| Minimum gap between any two posts in the same window (ODOI included) | 1 hour |
+| Saturday afternoon post | 1 on Saturdays only, random time between 12:00 and 16:00, welcome-back wording (6 messages), image `AFTERNOON.png` if present in Drive, otherwise text only |
+| ODOI post | Follows **every** post (morning, evening and Saturday afternoon), in the same group, about a minute later (random 45-100 s lag), so 4 per weekday and 5 on Saturdays |
+| Minimum gap between two posts in the same window | 1 hour |
 | Several groups | 20-90 s random pause between groups |
 
-The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png` and `ODOI.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
+The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png`, `ODOI.png` and (optional) `AFTERNOON.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
 
 ## ODOI post
 
-The `ODOI.png` post is sent exactly like the others (same random scheduling, 1-hour gap, 20-90 s pauses between groups, lateness check, restart resume) but its caption is a fixed message from `lib/content.js` (`ODOI_CAPTION`), with no greeting or signature and no rotation. Which of the three slots in a window is the ODOI one is random each day. If a late start leaves room for fewer posts, the day is planned with fewer posts. `!status` marks it as `ODOI image`.
+`ODOI.png` is posted in each group right after that group's morning, afternoon or evening post, after a random lag of 45-100 seconds, with a fixed caption from `lib/content.js` (`ODOI_CAPTION`): no greeting, no signature, no rotation. The lag is random so it is not an identical gap every time. If `ODOI.png` is missing or cannot be downloaded, the regular post is still sent alone. `!status` shows `image + ODOI` for these posts.
 
 ## Wording
 
@@ -29,7 +30,7 @@ All wording lives in `lib/content.js`. Every post is:
 🔶 𝗚𝗨𝗜𝗟𝗗 𝗔𝗦𝗣𝗜𝗥𝗔𝗡𝗧 🔶
 ```
 
-Morning and evening each have their own 10 messages. A message is not used again until all 10 in its pool have been used once; then a new shuffled round starts that never begins with the message just used. A message only counts as used once it has reached a group. The used lists are kept in `state.json` on the volume.
+Morning and evening each have their own 10 messages; the Saturday afternoon post has its own 6 (greeting `🔷 Good afternoon 🔷`). A message is not used again until all 10 in its pool have been used once; then a new shuffled round starts that never begins with the message just used. A message only counts as used once it has reached a group. The used lists are kept in `state.json` on the volume.
 
 ## Control it without redeploying
 
@@ -40,11 +41,19 @@ Send these from the linked phone, ideally in your own "Message yourself" chat. O
 | `!status` | Paused/active, WhatsApp status, last result, group count and today's plan |
 | `!pause` / `!resume` | Stop or continue posting (planned posts during a pause are skipped, not queued) |
 | `!groups` | Lists the groups being posted to, by name |
-| `!addgroup` | Send **inside a group** to add it. You get a private confirmation, and the command message is deleted from the group |
+| `!addgroup` (or the word `YHWH`) | Send **inside a group** to add it. You get a private confirmation, and the command message is deleted from the group |
 | `!removegroup` | Send inside a group to stop posting there |
 | `!getid` | Inside a group, replies with that group's ID |
 
 Added and removed groups are saved in `state.json` on the volume and applied on top of `WHATSAPP_GROUP_IDS`, so no redeploy is needed.
+
+**Add a group without typing a command in it:** open `https://YOUR-APP.up.railway.app/manage?token=YOUR_TOKEN`. It lists every group the account is in, with its name and ID, and an Add / Remove button for each. Nothing is sent to any group.
+
+**Add a group with a word:** send exactly `YHWH` (any case) inside a group. It adds the group, replies privately in your own chat, and deletes the message from the group. Only your own account is obeyed. To use a different word, set `ADD_GROUP_WORD` in Railway (one word, 4+ characters).
+
+### Keeping groups across deploys
+
+Groups are saved next to the WhatsApp login in `WHATSAPP_AUTH_PATH`. That folder **must be on a Railway volume**, otherwise every deploy wipes it (`!status` and `/manage` show a warning when it looks like it is not). For a guarantee that does not depend on the volume, `/groups` and `!groups` print a ready-made line `WHATSAPP_GROUP_IDS=...`; paste it into the Railway variables and those groups are always included.
 
 ### Control links (more reliable than commands)
 

@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { EVENING_MESSAGES, MORNING_MESSAGES, POOLS, SIGNATURE, drawVariant, formatPost } = require('../lib/content');
+const { AFTERNOON_MESSAGES, EVENING_MESSAGES, MORNING_MESSAGES, POOLS, SIGNATURE, drawVariant, formatPost } = require('../lib/content');
 
 function seeded(seed) {
     let state = seed;
@@ -34,7 +34,7 @@ test('evening messages do not welcome people back', () => {
     }
 });
 
-test('10 draws per period use every message once, then a new round never starts with the last one', () => {
+test('one round per period uses every message once, then a new round never starts with the last one', () => {
     for (const period of Object.keys(POOLS)) {
         for (let seed = 1; seed <= 200; seed += 1) {
             const random = seeded(seed);
@@ -43,14 +43,14 @@ test('10 draws per period use every message once, then a new round never starts 
             let previous;
             for (let i = 0; i < 50; i += 1) {
                 const draw = drawVariant(period, state, random);
-                if (i < 10) {
+                if (i < POOLS[period].length) {
                     firstRound.add(draw.index);
                 }
                 assert.notEqual(draw.index, previous);
                 previous = draw.index;
                 state = draw.state;
             }
-            assert.equal(firstRound.size, 10);
+            assert.equal(firstRound.size, POOLS[period].length);
         }
     }
 });
@@ -72,4 +72,11 @@ test('the ODOI caption is the exact fixed text', () => {
     assert.ok(ODOI_CAPTION.endsWith('All the very best in your papers! ✨\n\nODOI JORAM'));
     assert.equal(ODOI_CAPTION.split('\n\n').length, 5);
     assert.ok(ODOI_CAPTION.length < 1024);
+});
+
+test('afternoon welcome-back wording: own greeting, signature, no day names, nothing shared with other pools', () => {
+    assert.equal(new Set(AFTERNOON_MESSAGES).size, AFTERNOON_MESSAGES.length);
+    assert.equal(formatPost('afternoon', 0), `🔷 Good afternoon 🔷\n\n${AFTERNOON_MESSAGES[0]}\n\n${SIGNATURE.join('\n')}`);
+    assert.doesNotMatch(AFTERNOON_MESSAGES.join('\n'), /monday|tuesday|wednesday|thursday|friday|saturday|sunday/i);
+    assert.equal(AFTERNOON_MESSAGES.filter((m) => MORNING_MESSAGES.includes(m) || EVENING_MESSAGES.includes(m)).length, 0);
 });

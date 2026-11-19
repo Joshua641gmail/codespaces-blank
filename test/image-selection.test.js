@@ -55,3 +55,9 @@ test('picks only ODOI.png by exact name and image type', () => {
     assert.equal(selectOdoiImage([files[2]]), undefined);
     assert.throws(() => selectOdoiImage([odoi, { ...odoi, id: 'o2' }]), /More than one image named ODOI\.png/);
 });
+
+test('AFTERNOON.png is matched by exact name; no such image means undefined (text-only fallback)', () => {
+    const afternoon = { id: 'a', name: 'AFTERNOON.png', mimeType: 'image/png' };
+    assert.equal(selectImage([afternoon], 'afternoon'), afternoon);
+    assert.equal(selectImage([{ id: 'm', name: 'MORNING.png', mimeType: 'image/png' }], 'afternoon'), undefined);
+});

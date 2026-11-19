@@ -14,7 +14,7 @@ const http = require('node:http');
 const path = require('node:path');
 const pino = require('pino');
 require('dotenv').config();
-const { ODOI_IMAGE_NAME, isPostingDay, selectImage, selectOdoiImage } = require('./lib/image-selection');
+const { ODOI_IMAGE_NAME, isPostingDay, selectImage, selectOdoiImage, weekdayNameFor } = require('./lib/image-selection');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
 const { ODOI_CAPTION, drawVariant, formatPost } = require('./lib/content');
 
@@ -31,6 +31,13 @@ const serviceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.en
 const lastPostDate = process.env.LAST_POST_DATE?.trim() || '2026-12-05';
 const sessionPath = process.env.WHATSAPP_AUTH_PATH || path.join(process.cwd(), '.baileys_auth');
 const pairingPhoneNumber = process.env.WHATSAPP_PHONE_NUMBER?.trim();
+// The word that, sent by you inside a group, adds that group (and deletes itself), like !addgroup.
+// Defaults to YHWH (any case); set ADD_GROUP_WORD to change it, or to a blank/short value to turn it off.
+const rawAddGroupWord = (process.env.ADD_GROUP_WORD ?? 'yhwh').trim().toLowerCase();
+const addGroupWord = rawAddGroupWord && /^\S{4,}$/.test(rawAddGroupWord) ? rawAddGroupWord : undefined;
+if (rawAddGroupWord && !addGroupWord) {
+    console.warn('ADD_GROUP_WORD is ignored: it must be one word of at least 4 characters.');
+}
 
 if (!folderId) {
     throw new Error('GOOGLE_DRIVE_FOLDER_ID must be set.');
@@ -80,7 +87,9 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
 // A post that is more than this late (for example after a long outage) is skipped, not sent in a rush.
 const MAX_LATE_SECONDS = 30 * 60;
-const PLAN_VERSION = 3;
+const PLAN_VERSION = 4;
+// ODOI follows each morning/evening post in the same group about a minute later (random, so not a fixed gap).
+const ODOI_LAG_MS = { min: 45_000, max: 100_000 };
 const planPath = path.join(sessionPath, 'daily-plan.json');
 const statePath = path.join(sessionPath, 'state.json');
 const scheduledEntries = new Set();
@@ -145,6 +154,22 @@ function changeGroupList(groupId, action) {
     return { wasIn, count: getGroupIds().length };
 }
 
+// Groups and the daily plan are saved next to the WhatsApp login. If that folder is not on a
+// persistent volume, every deploy wipes them, so say so loudly.
+function storageWarning() {
+    if (!process.env.WHATSAPP_AUTH_PATH) {
+        return 'WARNING: WHATSAPP_AUTH_PATH is not set, so added groups are lost on every deploy. Mount a Railway volume and set it (for example /data/baileys_auth).';
+    }
+    try {
+        if (fs.statSync(sessionPath).dev === fs.statSync(process.cwd()).dev) {
+            return 'WARNING: the storage folder looks like it is not on a separate volume, so added groups may be lost on deploy.';
+        }
+    } catch {
+        // Folder not created yet; nothing to compare.
+    }
+    return '';
+}
+
 async function groupName(socket, groupId) {
     try {
         return (await socket?.groupMetadata(groupId))?.subject || groupId;
@@ -160,7 +185,13 @@ async function groupsText() {
     }
     const socket = whatsappStatus === 'connected' ? whatsappSocket : undefined;
     const names = await Promise.all(ids.map((id) => groupName(socket, id)));
-    return `Posting to ${ids.length} group(s):\n${names.map((name, index) => `${index + 1}. ${name}`).join('\n')}`;
+    return [
+        `Posting to ${ids.length} group(s):`,
+        ...names.map((name, index) => `${index + 1}. ${name}`),
+        '',
+        'To make the list survive any redeploy, set this Railway variable:',
+        `WHATSAPP_GROUP_IDS=${ids.join(',')}`,
+    ].join('\n');
 }
 
 async function updateGroup(groupId, action) {
@@ -221,7 +252,7 @@ const server = http.createServer(async (request, response) => {
         return;
     }
 
-    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/addgroup', '/removegroup'];
+    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/manage', '/addgroup', '/removegroup'];
     if (request.method !== 'GET' || !adminPaths.includes(url.pathname) || !tokenMatches(url.searchParams.get('token'))) {
         send(404, 'not found');
         return;
@@ -230,13 +261,21 @@ const server = http.createServer(async (request, response) => {
     try {
         if (url.pathname === '/groups') {
             send(200, await groupsText());
+        } else if (url.pathname === '/manage') {
+            send(200, await manageGroupsPage(url.searchParams.get('token')), 'text/html');
         } else if (url.pathname === '/addgroup' || url.pathname === '/removegroup') {
             const id = (url.searchParams.get('id') || '').trim();
             if (!GROUP_ID_PATTERN.test(id)) {
                 send(400, 'Add id=<group id ending in @g.us> to the link.');
                 return;
             }
-            send(200, await updateGroup(id, url.pathname === '/addgroup' ? 'add' : 'remove'));
+            const message = await updateGroup(id, url.pathname === '/addgroup' ? 'add' : 'remove');
+            if (url.searchParams.get('back') === '1') {
+                response.writeHead(302, { location: `/manage?token=${encodeURIComponent(url.searchParams.get('token'))}` });
+                response.end();
+                return;
+            }
+            send(200, message);
         } else {
             if (url.pathname === '/pause') {
                 setPaused(true);
@@ -259,6 +298,34 @@ server.listen(Number(process.env.PORT) || 3000, '0.0.0.0', () => {
     console.log(`Health endpoint listening on port ${server.address().port}.`);
 });
 
+function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+}
+
+// Browser page listing every group this account is in, with its ID and add/remove buttons,
+// so you never need to type anything inside a group.
+async function manageGroupsPage(token) {
+    const page = (body) => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Groups</title>
+<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:1rem auto;padding:0 1rem}li{margin:.7rem 0;padding:.6rem;border:1px solid #8884;border-radius:8px}code{font-size:.8rem;word-break:break-all}a.b{display:inline-block;margin-top:.4rem;padding:.3rem .8rem;border-radius:6px;background:#1a7f4b;color:#fff;text-decoration:none}a.r{background:#b3261e}</style>${body}`;
+    if (whatsappStatus !== 'connected' || !whatsappSocket) {
+        return page('<p>WhatsApp is not connected yet. Refresh in a minute.</p>');
+    }
+
+    const all = Object.values(await whatsappSocket.groupFetchAllParticipating());
+    all.sort((x, y) => String(x.subject).localeCompare(String(y.subject)));
+    const posting = new Set(getGroupIds());
+    const encodedToken = encodeURIComponent(token);
+    const items = all.map((group) => {
+        const on = posting.has(group.id);
+        const action = on ? 'removegroup' : 'addgroup';
+        return `<li><b>${escapeHtml(group.subject)}</b> ${on ? '(posting)' : ''}<br><code>${escapeHtml(group.id)}</code><br>`
+            + `<a class="b ${on ? 'r' : ''}" href="/${action}?token=${encodedToken}&id=${encodeURIComponent(group.id)}&back=1">${on ? 'Remove' : 'Add'}</a></li>`;
+    });
+    const warning = storageWarning();
+    return page(`<h2>Groups (${posting.size} posting)</h2>${warning ? `<p><b>${escapeHtml(warning)}</b></p>` : ''}<ul style="list-style:none;padding:0">${items.join('')}</ul>`
+        + `<p>To make the list permanent even without a volume, set <code>WHATSAPP_GROUP_IDS=${escapeHtml([...posting].join(','))}</code> in Railway.</p>`);
+}
+
 function messageText(message) {
     const content = normalizeMessageContent(message.message);
     return (content?.conversation || content?.extendedTextMessage?.text || '').trim();
@@ -272,6 +339,9 @@ function statusText() {
         `Last result: ${lastResult}`,
         `Groups: ${getGroupIds().length} (last post day: ${lastPostDate})`,
     ];
+    if (storageWarning()) {
+        lines.push(storageWarning());
+    }
     if (groupProblems.size > 0) {
         lines.push('Groups being skipped:');
         for (const [groupId, reason] of groupProblems) {
@@ -281,7 +351,7 @@ function statusText() {
     if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
         lines.push(`Today (${timezone}):`);
         for (const entry of plan.entries) {
-            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} ${entry.kind === 'odoi' ? 'ODOI image' : 'image'} - ${entry.status}`);
+            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} image + ODOI - ${entry.status}`);
         }
     } else {
         lines.push('No posts planned for the rest of today.');
@@ -300,11 +370,18 @@ const COMMAND_PATTERN = /^(?:!getid|getid!|!pause|!resume|!status|!groups|!addgr
 
 async function handleCommand(socket, message) {
     const chatId = message.key.remoteJid;
-    const body = messageText(message);
-    if (!COMMAND_PATTERN.test(body)) {
+    let body = messageText(message);
+    const isKeyword = Boolean(addGroupWord) && body.toLowerCase() === addGroupWord;
+    if (isKeyword) {
+        // Only meaningful inside a group; anywhere else it is just a normal message.
+        if (!message.key.fromMe || !chatId?.endsWith('@g.us')) {
+            return;
+        }
+        body = '!addgroup';
+    } else if (!COMMAND_PATTERN.test(body)) {
         return;
     }
-    console.log(`Command "${body}" seen (fromMe=${Boolean(message.key.fromMe)}, chat=${chatId?.split('@')[1] || 'unknown'}).`);
+    console.log(`Command "${isKeyword ? 'group keyword' : body}" seen (fromMe=${Boolean(message.key.fromMe)}, chat=${chatId?.split('@')[1] || 'unknown'}).`);
     if (!message.key.fromMe) {
         return;
     }
@@ -412,6 +489,9 @@ async function connectWhatsApp() {
             console.log('WhatsApp client is ready.');
             if (getGroupIds().length === 0) {
                 console.log('WhatsApp connected, but no groups are set. Send !addgroup inside each target group.');
+            }
+            if (storageWarning()) {
+                console.warn(storageWarning());
             }
             console.log(`WhatsApp connected. Daily randomized post plan active (${timezone}, last post day ${lastPostDate}).`);
             setupSchedules();
@@ -534,8 +614,10 @@ async function groupBlocker(socket, groupId) {
 }
 
 // Sends to every group with a random pause in between, so groups are not hit in one burst.
-// A group that cannot be posted to is skipped and the others still get the post.
-async function sendToGroups(socket, buildContent) {
+// `messages` is sent to each group in order, with a random lag of about a minute between them
+// (the ODOI post follows the regular post in the same group). A group that cannot be posted to
+// is skipped and the others still get the post.
+async function sendToGroups(socket, messages) {
     const result = { sent: 0, skipped: 0, failed: 0 };
     let attempted = 0;
 
@@ -553,13 +635,23 @@ async function sendToGroups(socket, buildContent) {
         }
         attempted += 1;
         try {
-            await socket.sendMessage(groupId, buildContent());
+            await socket.sendMessage(groupId, messages[0]);
             groupProblems.delete(groupId);
             result.sent += 1;
         } catch (error) {
             groupProblems.set(groupId, `send failed: ${error.message}`);
             console.error(`Could not post to group ${groupId}:`, error);
             result.failed += 1;
+            continue;
+        }
+
+        for (const followUp of messages.slice(1)) {
+            await sleep(randomBetween(ODOI_LAG_MS.min, ODOI_LAG_MS.max));
+            try {
+                await socket.sendMessage(groupId, followUp);
+            } catch (error) {
+                console.error(`Could not send the follow-up post to group ${groupId}:`, error);
+            }
         }
     }
 
@@ -571,43 +663,55 @@ function describeResult(result) {
     return `${result.sent}/${total} group(s)`;
 }
 
-async function sendDailyImage(entry) {
-    const period = entry.period;
-    const isOdoi = entry.kind === 'odoi';
-    const files = await listImagesInFolder();
-    const image = isOdoi ? selectOdoiImage(files) : selectImage(files, period);
-    if (!image) {
-        const missing = isOdoi ? ODOI_IMAGE_NAME : `${period.toUpperCase()}.png`;
-        console.log(`Skipping ${entry.id}; ${missing} was not found in the configured Drive folder.`);
-        return undefined;
-    }
-
+async function downloadImage(image) {
     const response = await driveClient.files.get(
         { fileId: image.id, alt: 'media' },
         { responseType: 'arraybuffer' },
     );
-    const socket = requireConnectedSocket('scheduled image');
-    const media = Buffer.from(response.data);
+    return Buffer.from(response.data);
+}
 
-    // The ODOI post uses its fixed caption and does not touch the rotating wording.
-    let caption = ODOI_CAPTION;
-    let wording;
-    const savedWording = loadState().wording || {};
-    if (!isOdoi) {
-        wording = drawVariant(period, savedWording[period]);
-        caption = formatPost(period, wording.index);
+async function sendDailyImage(entry) {
+    const period = entry.period;
+    const isAfternoon = period === 'afternoon';
+    const files = await listImagesInFolder();
+    const image = selectImage(files, period);
+    // Morning and evening need their image; the Saturday afternoon post falls back to text only.
+    if (!image && !isAfternoon) {
+        console.log(`Skipping ${entry.id}; ${period.toUpperCase()}.png was not found in the configured Drive folder.`);
+        return undefined;
     }
-    const result = await sendToGroups(socket, () => ({
-        image: media,
-        mimetype: image.mimeType,
-        caption,
-    }));
+
+    const socket = requireConnectedSocket('scheduled image');
+    const savedWording = loadState().wording || {};
+    const wording = drawVariant(period, savedWording[period]);
+    const caption = formatPost(period, wording.index);
+    const messages = [image
+        ? { image: await downloadImage(image), mimetype: image.mimeType, caption }
+        : { text: caption }];
+
+    // ODOI follows every post (morning, afternoon, evening) in the same group. If its image is
+    // missing or cannot be fetched, the regular post is still sent on its own.
+    {
+        try {
+            const odoi = selectOdoiImage(files);
+            if (odoi) {
+                messages.push({ image: await downloadImage(odoi), mimetype: odoi.mimeType, caption: ODOI_CAPTION });
+            } else {
+                console.log(`${ODOI_IMAGE_NAME} was not found in the configured Drive folder; posting without it (${entry.id}).`);
+            }
+        } catch (error) {
+            console.error(`Could not prepare ${ODOI_IMAGE_NAME}; posting without it (${entry.id}):`, error);
+        }
+    }
+
+    const result = await sendToGroups(socket, messages);
     // Only mark the wording as used when it actually reached a group.
-    if (wording && result.sent > 0) {
+    if (result.sent > 0) {
         saveState({ wording: { ...savedWording, [period]: wording.state } });
     }
 
-    console.log(`Posted ${image.name} with a caption to ${describeResult(result)} (${entry.id}).`);
+    console.log(`Posted ${image?.name || 'a text post'} (${messages.length} message(s) per group) to ${describeResult(result)} (${entry.id}).`);
     return result;
 }
 
@@ -647,11 +751,12 @@ function ensureTodayPlan() {
 
     const entries = planDay({
         isPostingDay: isPostingDay(now, timezone, dateKey, lastPostDate),
+        isSaturday: weekdayNameFor(now, timezone) === 'SATURDAY',
         fromSecond: localSecondsFor(now, timezone) + 120,
     }).map((entry) => ({ ...entry, status: 'pending' }));
     const plan = { version: PLAN_VERSION, dateKey, entries };
     savePlan(plan);
-    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}${entry.kind === 'odoi' ? '(odoi)' : ''}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
+    console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
     return plan;
 }
 

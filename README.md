@@ -4,11 +4,13 @@ This service runs continuously on Railway and posts **images with a caption** to
 
 | Rule | Value |
 |---|---|
-| Morning posts | 2 per day, random times between 5:00 and 7:30 AM, image `MORNING.png` |
-| Evening posts | 2 per day, random times between 5:00 and 8:00 PM, image `EVENING.png` |
+| Morning posts | 2 per day, random times between 5:00 and 10:00 AM, image `MORNING.png` |
+| Evening posts | 2 per day, random times between 5:00 and 10:00 PM, image `EVENING.png` |
 | Saturday afternoon post | 1 on Saturdays only, random time between 12:00 and 16:00, welcome-back wording (6 messages), image `AFTERNOON.png` if present in Drive, otherwise text only |
 | ODOI post | Follows **every** post (morning, evening and Saturday afternoon), in the same group, about a minute later (random 45-100 s lag), so 4 per weekday and 5 on Saturdays |
 | Minimum gap between two posts in the same window | 1 hour |
+| 23 November 2026 only | keeps the original windows (morning 5:00-7:30 AM, evening 5:00-8:00 PM); every other day uses the wider ones (`LEGACY_WINDOW_DATES` in `lib/post-schedule.js`) |
+| New windows start | with the next day's plan; a plan already made for today is not changed |
 | Several groups | 20-90 s random pause between groups |
 
 The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png`, `ODOI.png` and (optional) `AFTERNOON.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
@@ -96,3 +98,12 @@ This uses Baileys, an unofficial WhatsApp Web protocol library, not the official
 ## Credential hygiene
 
 Never commit `.env`, Google service-account keys, or `.baileys_auth`. Ignore rules do not remove previously committed files from Git history. Revoke and replace any exposed Google key, unlink/re-link the WhatsApp session if it was shared, and remove exposed artifacts from repository history before deploying or making the repository public.
+
+
+## Posting through to the last group
+
+A post can take a long time (pauses between groups, plus ODOI about a minute after each). To make sure every group is reached:
+
+- The live connection is looked up again before every message. If WhatsApp drops, the post waits (up to 10 minutes) for the reconnect and carries on with the remaining groups. A message that failed only because the connection closed is retried once.
+- Each group is saved as done as soon as it is posted to. If the service restarts part-way, the post resumes for the groups not yet posted to (up to 3 hours later) and never repeats the ones that already got it.
+- On a deploy or stop signal, the service waits for a post in progress to finish (up to 30 minutes, change with `GRACEFUL_SHUTDOWN_MINUTES`) before exiting. Railway also has to allow this time: set the Railway variable `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` to something like `1800`, otherwise Railway may stop the old deployment sooner.

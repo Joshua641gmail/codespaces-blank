@@ -87,6 +87,14 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 5 * 60 * 1000;
 // A post that is more than this late (for example after a long outage) is skipped, not sent in a rush.
 const MAX_LATE_SECONDS = 30 * 60;
+// A post that was interrupted part-way (restart, redeploy) is resumed for the groups not yet
+// posted to, as long as it is not older than this.
+const MAX_RESUME_SECONDS = 3 * 60 * 60;
+// How long a post waits for WhatsApp to reconnect after a drop before giving up on the rest.
+const RECONNECT_WAIT_MS = 10 * 60 * 1000;
+// On a deploy/stop signal, wait this long for a post in progress to finish before exiting.
+const SHUTDOWN_WAIT_MS = (Number(process.env.GRACEFUL_SHUTDOWN_MINUTES) || 30) * 60 * 1000;
+let activePosts = 0;
 const PLAN_VERSION = 4;
 // ODOI follows each morning/evening post in the same group about a minute later (random, so not a fixed gap).
 const ODOI_LAG_MS = { min: 45_000, max: 100_000 };
@@ -213,6 +221,24 @@ function setPaused(value) {
 }
 
 // Log problems instead of letting one stray error crash the service (Railway shows a crash as a failed deploy).
+// On a deploy or stop signal, let a post that is in progress finish for all groups first.
+let shuttingDown = false;
+function shutdownGracefully(signal) {
+    if (shuttingDown) {
+        return;
+    }
+    shuttingDown = true;
+    console.log(`${signal} received; ${activePosts > 0 ? 'waiting for the post in progress to finish' : 'exiting'}.`);
+    const deadline = Date.now() + SHUTDOWN_WAIT_MS;
+    const check = setInterval(() => {
+        if (activePosts === 0 || Date.now() >= deadline) {
+            clearInterval(check);
+            process.exit(0);
+        }
+    }, 2000);
+}
+process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+process.on('SIGINT', () => shutdownGracefully('SIGINT'));
 process.on('unhandledRejection', (error) => console.error('Unhandled rejection:', error));
 process.on('uncaughtException', (error) => console.error('Uncaught exception:', error));
 
@@ -573,14 +599,6 @@ async function listImagesInFolder() {
     return files;
 }
 
-function requireConnectedSocket(action) {
-    const socket = whatsappSocket;
-    if (!socket || whatsappStatus !== 'connected') {
-        throw new Error(`WhatsApp is not connected; cannot post the ${action}.`);
-    }
-    return socket;
-}
-
 // Works out whether this account can post in a group. Only definite problems skip a
 // group (it was removed, or only admins may post and we are not one); anything unclear
 // is treated as "try sending".
@@ -613,15 +631,59 @@ async function groupBlocker(socket, groupId) {
     return problem;
 }
 
+// Waits (up to maxMs) for WhatsApp to be connected and returns the live socket. The socket is
+// looked up again for every send, so a reconnect in the middle of a long post run is picked up.
+async function waitForConnection(maxMs = RECONNECT_WAIT_MS) {
+    const deadline = Date.now() + maxMs;
+    for (;;) {
+        if (whatsappStatus === 'connected' && whatsappSocket) {
+            return whatsappSocket;
+        }
+        if (Date.now() >= deadline) {
+            return undefined;
+        }
+        await sleep(5000);
+    }
+}
+
+// Sends one message on the current connection. If the connection closed under it, waits for the
+// reconnect and tries once more (a closed connection never sent the message, so no duplicate).
+async function sendLive(groupId, content) {
+    for (let attempt = 1; ; attempt += 1) {
+        const socket = await waitForConnection();
+        if (!socket) {
+            throw new Error('WhatsApp stayed disconnected');
+        }
+        try {
+            return await socket.sendMessage(groupId, content);
+        } catch (error) {
+            if (attempt >= 2 || !/connection (closed|failure|lost)|not connected|stream errored/i.test(String(error?.message))) {
+                throw error;
+            }
+            console.warn(`Connection dropped while posting to ${groupId}; waiting for it to come back.`);
+            await sleep(5000);
+        }
+    }
+}
+
 // Sends to every group with a random pause in between, so groups are not hit in one burst.
 // `messages` is sent to each group in order, with a random lag of about a minute between them
 // (the ODOI post follows the regular post in the same group). A group that cannot be posted to
-// is skipped and the others still get the post.
-async function sendToGroups(socket, messages) {
+// is skipped and the others still get the post. Groups in `alreadySent` (from an interrupted
+// run of the same post) are left alone, and `onSent` is told about every group as it is done.
+async function sendToGroups(messages, { alreadySent = [], onSent = () => {} } = {}) {
     const result = { sent: 0, skipped: 0, failed: 0 };
+    const groupIds = getGroupIds().filter((groupId) => !alreadySent.includes(groupId));
     let attempted = 0;
 
-    for (const groupId of getGroupIds()) {
+    for (const [position, groupId] of groupIds.entries()) {
+        const socket = await waitForConnection();
+        if (!socket) {
+            console.error('WhatsApp stayed disconnected; the remaining groups were not posted to.');
+            result.failed += groupIds.length - position;
+            break;
+        }
+
         const problem = await groupBlocker(socket, groupId);
         if (problem) {
             groupProblems.set(groupId, problem);
@@ -635,9 +697,10 @@ async function sendToGroups(socket, messages) {
         }
         attempted += 1;
         try {
-            await socket.sendMessage(groupId, messages[0]);
+            await sendLive(groupId, messages[0]);
             groupProblems.delete(groupId);
             result.sent += 1;
+            onSent(groupId);
         } catch (error) {
             groupProblems.set(groupId, `send failed: ${error.message}`);
             console.error(`Could not post to group ${groupId}:`, error);
@@ -648,7 +711,7 @@ async function sendToGroups(socket, messages) {
         for (const followUp of messages.slice(1)) {
             await sleep(randomBetween(ODOI_LAG_MS.min, ODOI_LAG_MS.max));
             try {
-                await socket.sendMessage(groupId, followUp);
+                await sendLive(groupId, followUp);
             } catch (error) {
                 console.error(`Could not send the follow-up post to group ${groupId}:`, error);
             }
@@ -671,7 +734,7 @@ async function downloadImage(image) {
     return Buffer.from(response.data);
 }
 
-async function sendDailyImage(entry) {
+async function sendDailyImage(entry, { alreadySent, onSent }) {
     const period = entry.period;
     const isAfternoon = period === 'afternoon';
     const files = await listImagesInFolder();
@@ -682,7 +745,9 @@ async function sendDailyImage(entry) {
         return undefined;
     }
 
-    const socket = requireConnectedSocket('scheduled image');
+    if (!await waitForConnection()) {
+        throw new Error(`WhatsApp is not connected; cannot post ${entry.id}.`);
+    }
     const savedWording = loadState().wording || {};
     const wording = drawVariant(period, savedWording[period]);
     const caption = formatPost(period, wording.index);
@@ -705,7 +770,7 @@ async function sendDailyImage(entry) {
         }
     }
 
-    const result = await sendToGroups(socket, messages);
+    const result = await sendToGroups(messages, { alreadySent, onSent });
     // Only mark the wording as used when it actually reached a group.
     if (result.sent > 0) {
         saveState({ wording: { ...savedWording, [period]: wording.state } });
@@ -752,6 +817,7 @@ function ensureTodayPlan() {
     const entries = planDay({
         isPostingDay: isPostingDay(now, timezone, dateKey, lastPostDate),
         isSaturday: weekdayNameFor(now, timezone) === 'SATURDAY',
+        dateKey,
         fromSecond: localSecondsFor(now, timezone) + 120,
     }).map((entry) => ({ ...entry, status: 'pending' }));
     const plan = { version: PLAN_VERSION, dateKey, entries };
@@ -761,6 +827,10 @@ function ensureTodayPlan() {
 }
 
 async function runEntry(plan, entry) {
+    if (shuttingDown) {
+        // Left as it is; the next start picks it up.
+        return;
+    }
     if (plan.dateKey !== localDateKeyFor(new Date(), timezone)) {
         entry.status = 'missed';
         savePlan(plan);
@@ -782,11 +852,28 @@ async function runEntry(plan, entry) {
             savePlan(plan);
             return;
         }
-        const result = await sendDailyImage(entry);
+        // Remember which groups are done, so a restart half-way resumes instead of re-posting.
+        const alreadySent = entry.sentGroups || [];
+        entry.status = 'running';
+        entry.sentGroups = [...alreadySent];
+        savePlan(plan);
+        activePosts += 1;
+        let result;
+        try {
+            result = await sendDailyImage(entry, {
+                alreadySent,
+                onSent: (groupId) => {
+                    entry.sentGroups.push(groupId);
+                    savePlan(plan);
+                },
+            });
+        } finally {
+            activePosts -= 1;
+        }
 
         if (!result) {
             entry.status = 'skipped (nothing to post)';
-        } else if (result.sent > 0) {
+        } else if (result.sent + alreadySent.length > 0) {
             entry.status = result.skipped + result.failed === 0
                 ? 'done'
                 : `done (${describeResult(result)})`;
@@ -807,10 +894,11 @@ function schedulePlan(plan) {
     const nowSeconds = localSecondsFor(new Date(), timezone);
     for (const entry of plan.entries) {
         const key = `${plan.dateKey}:${entry.id}`;
-        if (entry.status !== 'pending' || scheduledEntries.has(key)) {
+        const interrupted = entry.status === 'running';
+        if ((entry.status !== 'pending' && !interrupted) || scheduledEntries.has(key)) {
             continue;
         }
-        if (nowSeconds - entry.atSecond > MAX_LATE_SECONDS) {
+        if (nowSeconds - entry.atSecond > (interrupted ? MAX_RESUME_SECONDS : MAX_LATE_SECONDS)) {
             entry.status = 'missed';
             savePlan(plan);
             console.log(`Skipping ${entry.id}; its time (${formatSeconds(entry.atSecond)}) has already passed.`);
@@ -818,6 +906,9 @@ function schedulePlan(plan) {
         }
 
         scheduledEntries.add(key);
+        if (interrupted) {
+            console.log(`Resuming ${entry.id}; it was interrupted after ${entry.sentGroups?.length || 0} group(s).`);
+        }
         setTimeout(() => runEntry(plan, entry), Math.max(0, (entry.atSecond - nowSeconds) * 1000));
     }
 }

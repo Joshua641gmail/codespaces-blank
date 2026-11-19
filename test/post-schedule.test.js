@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { MIN_GAP_SECONDS, WINDOWS, localDateKeyFor, localSecondsFor, planDay } = require('../lib/post-schedule');
+const { LEGACY_WINDOWS, MIN_GAP_SECONDS, WINDOWS, localDateKeyFor, localSecondsFor, planDay } = require('../lib/post-schedule');
 
 function seeded(seed) {
     let state = seed;
@@ -40,12 +40,38 @@ test('Saturday adds exactly one random afternoon post between 12:00 and 16:00', 
     assert.equal(planDay({ random: seeded(1), isPostingDay: true }).some((entry) => entry.period === 'afternoon'), false);
 });
 
-test('morning is 5:00-7:30, evening is 17:00-20:00 and Saturday afternoon is 12:00-16:00', () => {
+test('morning is 5:00-10:00, evening is 17:00-22:00 and Saturday afternoon is 12:00-16:00', () => {
     assert.deepEqual(WINDOWS, {
-        morning: { start: 5 * 3600, end: 7.5 * 3600 },
-        evening: { start: 17 * 3600, end: 20 * 3600 },
+        morning: { start: 5 * 3600, end: 10 * 3600 },
+        evening: { start: 17 * 3600, end: 22 * 3600 },
         afternoon: { start: 12 * 3600, end: 16 * 3600 },
     });
+});
+
+test('only 23 November 2026 keeps the original 5:00-7:30 and 17:00-20:00 windows', () => {
+    for (let seed = 1; seed <= 300; seed += 1) {
+        for (const [dateKey, windows] of [['2026-11-23', LEGACY_WINDOWS], ['2026-11-24', WINDOWS], ['2026-11-22', WINDOWS]]) {
+            const plan = planDay({ random: seeded(seed), isPostingDay: true, dateKey });
+            assert.equal(plan.length, 4);
+            for (const { period, atSecond } of plan) {
+                assert.ok(atSecond >= windows[period].start && atSecond < windows[period].end, `${dateKey} ${period} ${atSecond}`);
+            }
+        }
+    }
+    assert.deepEqual(LEGACY_WINDOWS.morning, { start: 5 * 3600, end: 7.5 * 3600 });
+    assert.deepEqual(LEGACY_WINDOWS.evening, { start: 17 * 3600, end: 20 * 3600 });
+});
+
+test('the wider windows spread posts: morning posts can land after 7:30 and evening after 20:00', () => {
+    let lateMorning = false;
+    let lateEvening = false;
+    for (let seed = 1; seed <= 300; seed += 1) {
+        for (const { period, atSecond } of planDay({ random: seeded(seed), isPostingDay: true })) {
+            lateMorning ||= period === 'morning' && atSecond > 7.5 * 3600;
+            lateEvening ||= period === 'evening' && atSecond > 20 * 3600;
+        }
+    }
+    assert.ok(lateMorning && lateEvening);
 });
 
 test('plans are sorted, have unique ids and differ from day to day', () => {
@@ -68,11 +94,11 @@ test('a late start only plans what is left of the day', () => {
     assert.ok(afternoon.every((entry) => entry.period === 'evening'));
     assert.equal(afternoon.length, 2);
 
-    const lateEvening = planDay({ random: seeded(3), isPostingDay: true, fromSecond: 19 * 3600 + 15 * 60 });
+    const lateEvening = planDay({ random: seeded(3), isPostingDay: true, fromSecond: 21 * 3600 + 15 * 60 });
     assert.ok(lateEvening.length <= 1);
-    lateEvening.forEach(({ atSecond }) => assert.ok(atSecond >= 19 * 3600 + 15 * 60));
+    lateEvening.forEach(({ atSecond }) => assert.ok(atSecond >= 21 * 3600 + 15 * 60));
 
-    assert.deepEqual(planDay({ isPostingDay: true, fromSecond: 21 * 3600 }), []);
+    assert.deepEqual(planDay({ isPostingDay: true, fromSecond: 22 * 3600 }), []);
 });
 
 test('rejects an invalid random source', () => {

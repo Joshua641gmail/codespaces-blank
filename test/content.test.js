@@ -80,3 +80,13 @@ test('afternoon welcome-back wording: own greeting, signature, no day names, not
     assert.doesNotMatch(AFTERNOON_MESSAGES.join('\n'), /monday|tuesday|wednesday|thursday|friday|saturday|sunday/i);
     assert.equal(AFTERNOON_MESSAGES.filter((m) => MORNING_MESSAGES.includes(m) || EVENING_MESSAGES.includes(m)).length, 0);
 });
+
+test('BROLINE and BREILINE captions are the exact fixed texts', () => {
+    const { BREILINE_CAPTION, BROLINE_CAPTION } = require('../lib/content');
+    assert.ok(BROLINE_CAPTION.startsWith('🎓✨ WISHING ALL STUDENTS SUCCESS IN THEIR EXAMINATIONS! ✨📚\n\nAs you prepare'));
+    assert.ok(BROLINE_CAPTION.includes('BUWEMBO BROLLIN\nASPIRING CHAIRPERSON – CGC, COCIS\n\nTOGETHER, WE CAN ACHIEVE MORE! ✊'));
+    assert.ok(BROLINE_CAPTION.endsWith('✊'));
+    assert.equal(BROLINE_CAPTION.split('\n\n').length, 8);
+    assert.equal(BREILINE_CAPTION, '*WISHING YOU THE VERY BEST IN YOUR EXAMS*\n*#MUMBERE BREILINE*\n*#93RD COCIS CHAIRPERSON*');
+    assert.ok(BROLINE_CAPTION.length < 1024 && BREILINE_CAPTION.length < 1024);
+});

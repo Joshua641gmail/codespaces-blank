@@ -14,9 +14,11 @@ const http = require('node:http');
 const path = require('node:path');
 const pino = require('pino');
 require('dotenv').config();
-const { ODOI_IMAGE_NAME, isPostingDay, selectImage, selectOdoiImage, weekdayNameFor } = require('./lib/image-selection');
+const { ODOI_IMAGE_NAME, isPostingDay, selectExtraImage, selectImage, selectOdoiImage, weekdayNameFor } = require('./lib/image-selection');
+const { enabledSteps, getChain, slotKey, stepLabel, validateChains } = require('./lib/chain');
+const { renderOrderPage } = require('./lib/order-page');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
-const { ODOI_CAPTION, drawVariant, formatPost } = require('./lib/content');
+const { BREILINE_CAPTION, BROLINE_CAPTION, ODOI_CAPTION, drawVariant, formatPost } = require('./lib/content');
 
 const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -96,8 +98,9 @@ const RECONNECT_WAIT_MS = 10 * 60 * 1000;
 const SHUTDOWN_WAIT_MS = (Number(process.env.GRACEFUL_SHUTDOWN_MINUTES) || 30) * 60 * 1000;
 let activePosts = 0;
 const PLAN_VERSION = 4;
-// ODOI follows each morning/evening post in the same group about a minute later (random, so not a fixed gap).
-const ODOI_LAG_MS = { min: 45_000, max: 100_000 };
+// Pause between one image and the next inside the same group: about 30 seconds (a few seconds of
+// random jitter so it is not an identical gap every time).
+const CHAIN_LAG_MS = { min: 25_000, max: 35_000 };
 const planPath = path.join(sessionPath, 'daily-plan.json');
 const statePath = path.join(sessionPath, 'state.json');
 const scheduledEntries = new Set();
@@ -278,14 +281,30 @@ const server = http.createServer(async (request, response) => {
         return;
     }
 
-    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/manage', '/addgroup', '/removegroup'];
-    if (request.method !== 'GET' || !adminPaths.includes(url.pathname) || !tokenMatches(url.searchParams.get('token'))) {
+    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/manage', '/order', '/addgroup', '/removegroup'];
+    const isOrderSave = request.method === 'POST' && url.pathname === '/order';
+    if ((request.method !== 'GET' && !isOrderSave) || !adminPaths.includes(url.pathname) || !tokenMatches(url.searchParams.get('token'))) {
         send(404, 'not found');
         return;
     }
 
     try {
-        if (url.pathname === '/groups') {
+        if (url.pathname === '/order') {
+            if (isOrderSave) {
+                let chains;
+                try {
+                    chains = validateChains(JSON.parse(await readBody(request)));
+                } catch (error) {
+                    send(400, error.message);
+                    return;
+                }
+                saveState({ chains });
+                console.log('Post image order updated from the /order page.');
+                send(200, 'saved');
+            } else {
+                send(200, orderPage(url.searchParams.get('token')), 'text/html');
+            }
+        } else if (url.pathname === '/groups') {
             send(200, await groupsText());
         } else if (url.pathname === '/manage') {
             send(200, await manageGroupsPage(url.searchParams.get('token')), 'text/html');
@@ -324,6 +343,32 @@ server.listen(Number(process.env.PORT) || 3000, '0.0.0.0', () => {
     console.log(`Health endpoint listening on port ${server.address().port}.`);
 });
 
+function readBody(request, limit = 20_000) {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        request.on('data', (chunk) => {
+            data += chunk;
+            if (data.length > limit) {
+                reject(new Error('Request too large.'));
+                request.destroy();
+            }
+        });
+        request.on('end', () => resolve(data));
+        request.on('error', reject);
+    });
+}
+
+function orderPage(token) {
+    const plan = loadPlan();
+    const today = {};
+    if (plan?.dateKey === localDateKeyFor(new Date(), timezone)) {
+        for (const entry of plan.entries) {
+            today[slotKey(entry.period, slotOf(plan, entry))] = `Today: ${formatSeconds(entry.atSecond)} - ${entry.status}`;
+        }
+    }
+    return renderOrderPage({ token, chains: loadState().chains, today });
+}
+
 function escapeHtml(text) {
     return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
@@ -357,6 +402,16 @@ function messageText(message) {
     return (content?.conversation || content?.extendedTextMessage?.text || '').trim();
 }
 
+// Which post of its window this entry is (1 = first, 2 = second, ...), used to look up its image order.
+function slotOf(plan, entry) {
+    return plan.entries.filter((item) => item.period === entry.period).indexOf(entry) + 1;
+}
+
+function chainLabel(plan, entry) {
+    const steps = enabledSteps(getChain(loadState().chains, entry.period, slotOf(plan, entry)));
+    return steps.map((key) => stepLabel(key, entry.period)).join(' > ') || 'nothing';
+}
+
 function statusText() {
     const plan = loadPlan();
     const lines = [
@@ -377,7 +432,7 @@ function statusText() {
     if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
         lines.push(`Today (${timezone}):`);
         for (const entry of plan.entries) {
-            lines.push(`${formatSeconds(entry.atSecond)} ${entry.period} image + ODOI - ${entry.status}`);
+            lines.push(`${formatSeconds(entry.atSecond)} ${chainLabel(plan, entry)} - ${entry.status}`);
         }
     } else {
         lines.push('No posts planned for the rest of today.');
@@ -668,7 +723,7 @@ async function sendLive(groupId, content) {
 
 // Sends to every group with a random pause in between, so groups are not hit in one burst.
 // `messages` is sent to each group in order, with a random lag of about a minute between them
-// (the ODOI post follows the regular post in the same group). A group that cannot be posted to
+// (the ODOI, BROLINE and BREILINE images follow the window's image in the same group). A group that cannot be posted to
 // is skipped and the others still get the post. Groups in `alreadySent` (from an interrupted
 // run of the same post) are left alone, and `onSent` is told about every group as it is done.
 async function sendToGroups(messages, { alreadySent = [], onSent = () => {} } = {}) {
@@ -709,7 +764,7 @@ async function sendToGroups(messages, { alreadySent = [], onSent = () => {} } = 
         }
 
         for (const followUp of messages.slice(1)) {
-            await sleep(randomBetween(ODOI_LAG_MS.min, ODOI_LAG_MS.max));
+            await sleep(randomBetween(CHAIN_LAG_MS.min, CHAIN_LAG_MS.max));
             try {
                 await sendLive(groupId, followUp);
             } catch (error) {
@@ -734,49 +789,75 @@ async function downloadImage(image) {
     return Buffer.from(response.data);
 }
 
-async function sendDailyImage(entry, { alreadySent, onSent }) {
+// Builds what is sent for one step of a post chain, or undefined (with a log line) when that
+// step cannot be sent, so the rest of the chain still goes out.
+async function buildStep(key, entry, files, wordingHolder) {
     const period = entry.period;
-    const isAfternoon = period === 'afternoon';
-    const files = await listImagesInFolder();
-    const image = selectImage(files, period);
-    // Morning and evening need their image; the Saturday afternoon post falls back to text only.
-    if (!image && !isAfternoon) {
-        console.log(`Skipping ${entry.id}; ${period.toUpperCase()}.png was not found in the configured Drive folder.`);
+    if (key === 'regular') {
+        const image = selectImage(files, period);
+        // The window's image is needed for morning and evening; Saturday afternoon falls back to text.
+        if (!image && period !== 'afternoon') {
+            console.log(`${period.toUpperCase()}.png was not found in the configured Drive folder; skipping that image (${entry.id}).`);
+            return undefined;
+        }
+        const savedWording = loadState().wording || {};
+        const wording = drawVariant(period, savedWording[period]);
+        const caption = formatPost(period, wording.index);
+        wordingHolder.pending = { period, state: wording.state };
+        return image
+            ? { image: await downloadImage(image), mimetype: image.mimeType, caption }
+            : { text: caption };
+    }
+
+    const wanted = { odoi: ODOI_IMAGE_NAME.replace(/\.[^.]+$/, ''), broline: 'BROLINE', breiline: 'BREILINE' }[key];
+    const image = key === 'odoi' ? selectOdoiImage(files) : selectExtraImage(files, wanted);
+    if (!image) {
+        console.log(`${wanted} was not found in the configured Drive folder; skipping it (${entry.id}).`);
         return undefined;
     }
+    const content = { image: await downloadImage(image), mimetype: image.mimeType };
+    // Each of these images has its own fixed caption, sent exactly as written.
+    content.caption = { odoi: ODOI_CAPTION, broline: BROLINE_CAPTION, breiline: BREILINE_CAPTION }[key];
+    return content;
+}
+
+async function sendDailyImage(entry, { slot, alreadySent, onSent }) {
+    const files = await listImagesInFolder();
+    // The order is read now, so whatever was saved on the /order page before this post started applies.
+    const steps = enabledSteps(getChain(loadState().chains, entry.period, slot));
 
     if (!await waitForConnection()) {
         throw new Error(`WhatsApp is not connected; cannot post ${entry.id}.`);
     }
-    const savedWording = loadState().wording || {};
-    const wording = drawVariant(period, savedWording[period]);
-    const caption = formatPost(period, wording.index);
-    const messages = [image
-        ? { image: await downloadImage(image), mimetype: image.mimeType, caption }
-        : { text: caption }];
 
-    // ODOI follows every post (morning, afternoon, evening) in the same group. If its image is
-    // missing or cannot be fetched, the regular post is still sent on its own.
-    {
+    const wordingHolder = {};
+    const messages = [];
+    for (const key of steps) {
         try {
-            const odoi = selectOdoiImage(files);
-            if (odoi) {
-                messages.push({ image: await downloadImage(odoi), mimetype: odoi.mimeType, caption: ODOI_CAPTION });
-            } else {
-                console.log(`${ODOI_IMAGE_NAME} was not found in the configured Drive folder; posting without it (${entry.id}).`);
+            const content = await buildStep(key, entry, files, wordingHolder);
+            if (content) {
+                messages.push(content);
             }
         } catch (error) {
-            console.error(`Could not prepare ${ODOI_IMAGE_NAME}; posting without it (${entry.id}):`, error);
+            console.error(`Could not prepare the ${key} step of ${entry.id}; skipping it:`, error);
+            if (key === 'regular') {
+                wordingHolder.pending = undefined;
+            }
         }
+    }
+    if (messages.length === 0) {
+        console.log(`Nothing to post for ${entry.id}.`);
+        return undefined;
     }
 
     const result = await sendToGroups(messages, { alreadySent, onSent });
     // Only mark the wording as used when it actually reached a group.
-    if (result.sent > 0) {
-        saveState({ wording: { ...savedWording, [period]: wording.state } });
+    if (wordingHolder.pending && result.sent > 0) {
+        const wording = loadState().wording || {};
+        saveState({ wording: { ...wording, [wordingHolder.pending.period]: wordingHolder.pending.state } });
     }
 
-    console.log(`Posted ${image?.name || 'a text post'} (${messages.length} message(s) per group) to ${describeResult(result)} (${entry.id}).`);
+    console.log(`Posted ${messages.length} image(s) per group to ${describeResult(result)} (${entry.id}).`);
     return result;
 }
 
@@ -861,6 +942,7 @@ async function runEntry(plan, entry) {
         let result;
         try {
             result = await sendDailyImage(entry, {
+                slot: slotOf(plan, entry),
                 alreadySent,
                 onSent: (groupId) => {
                     entry.sentGroups.push(groupId);

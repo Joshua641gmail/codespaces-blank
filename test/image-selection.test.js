@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { isPostingDay, selectImage, selectOdoiImage, weekdayNameFor } = require('../lib/image-selection');
+const { isPostingDay, selectImage, selectExtraImage, selectOdoiImage, weekdayNameFor } = require('../lib/image-selection');
 
 test('gets the weekday in the configured timezone', () => {
     assert.equal(weekdayNameFor(new Date('2026-10-19T07:30:00Z'), 'Africa/Nairobi'), 'MONDAY');
@@ -60,4 +60,18 @@ test('AFTERNOON.png is matched by exact name; no such image means undefined (tex
     const afternoon = { id: 'a', name: 'AFTERNOON.png', mimeType: 'image/png' };
     assert.equal(selectImage([afternoon], 'afternoon'), afternoon);
     assert.equal(selectImage([{ id: 'm', name: 'MORNING.png', mimeType: 'image/png' }], 'afternoon'), undefined);
+});
+
+test('BROLINE and BREILINE are matched by exact name with any image extension', () => {
+    const files = [
+        { id: '1', name: 'BROLINE.png', mimeType: 'image/png' },
+        { id: '2', name: 'BREILINE.jpg', mimeType: 'image/jpeg' },
+        { id: '3', name: 'broline.png', mimeType: 'image/png' },
+        { id: '4', name: 'BROLINE2.png', mimeType: 'image/png' },
+        { id: '5', name: 'BREILINE.pdf', mimeType: 'application/pdf' },
+    ];
+    assert.equal(selectExtraImage(files, 'BROLINE'), files[0]);
+    assert.equal(selectExtraImage(files, 'BREILINE'), files[1]);
+    assert.equal(selectExtraImage([files[2]], 'BROLINE'), undefined);
+    assert.throws(() => selectExtraImage([files[0], { ...files[0], id: '9', name: 'BROLINE.jpg' }], 'BROLINE'), /More than one image named BROLINE/);
 });

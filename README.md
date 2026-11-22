@@ -7,17 +7,19 @@ This service runs continuously on Railway and posts **images with a caption** to
 | Morning posts | 2 per day, random times between 5:00 and 10:00 AM, image `MORNING.png` |
 | Evening posts | 2 per day, random times between 5:00 and 10:00 PM, image `EVENING.png` |
 | Saturday afternoon post | 1 on Saturdays only, random time between 12:00 and 16:00, welcome-back wording (6 messages), image `AFTERNOON.png` if present in Drive, otherwise text only |
-| ODOI post | Follows **every** post (morning, evening and Saturday afternoon), in the same group, about a minute later (random 45-100 s lag), so 4 per weekday and 5 on Saturdays |
+| Images in each post | Every post is a chain sent to each group, about 30 s apart: the window image (with the rotating message), then `ODOI.png`, then `BROLINE` (a window's first post) or `BREILINE` (its second post). So each of BROLINE and BREILINE goes out once per morning and once per evening. The Saturday afternoon post is the window image + ODOI. The order and what is included can be changed from the `/order` page |
 | Minimum gap between two posts in the same window | 1 hour |
 | 23 November 2026 only | keeps the original windows (morning 5:00-7:30 AM, evening 5:00-8:00 PM); every other day uses the wider ones (`LEGACY_WINDOW_DATES` in `lib/post-schedule.js`) |
 | New windows start | with the next day's plan; a plan already made for today is not changed |
 | Several groups | 20-90 s random pause between groups |
 
-The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png`, `ODOI.png` and (optional) `AFTERNOON.png`. If one is missing, that post is skipped. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
+The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png`, `ODOI.png`, `BROLINE`, `BREILINE` and (optional) `AFTERNOON.png`. If one is missing, that image is skipped and the rest of the post still goes out. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
 
-## ODOI post
+## Image chain and the /order page
 
-`ODOI.png` is posted in each group right after that group's morning, afternoon or evening post, after a random lag of 45-100 seconds, with a fixed caption from `lib/content.js` (`ODOI_CAPTION`): no greeting, no signature, no rotation. The lag is random so it is not an identical gap every time. If `ODOI.png` is missing or cannot be downloaded, the regular post is still sent alone. `!status` shows `image + ODOI` for these posts.
+Each post sends several images to a group one after another, with a pause of about 30 seconds (25-35 s, so it is not an identical gap every time). By default the chain is: window image with the rotating message, `ODOI.png` (fixed caption from `lib/content.js`, `ODOI_CAPTION`), then `BROLINE` in a window's first post and `BREILINE` in its second post. `BROLINE` and `BREILINE` are matched by exact name in the Drive folder with any image extension (`BROLINE.png`, `BREILINE.jpg`) and each is sent with its own fixed caption (`BROLINE_CAPTION` and `BREILINE_CAPTION` in `lib/content.js`), exactly as written. If an image is missing the other steps still go out.
+
+**Changing the order:** open `https://YOUR-APP.up.railway.app/order?token=YOUR_TOKEN`. Each post (Morning post 1, Morning post 2, Evening post 1, Evening post 2, Afternoon post) has its images in a list. Use the arrows to move one up or down, untick to leave one out, then press Save. Saved changes apply to every post that has not started yet, at any time of day, and stay until you change them again. A post already in progress keeps the order it started with. `!status` shows each post's current order.
 
 ## Wording
 
@@ -102,7 +104,7 @@ Never commit `.env`, Google service-account keys, or `.baileys_auth`. Ignore rul
 
 ## Posting through to the last group
 
-A post can take a long time (pauses between groups, plus ODOI about a minute after each). To make sure every group is reached:
+A post can take a long time (pauses between groups, plus about 30 seconds between each image in a group). To make sure every group is reached:
 
 - The live connection is looked up again before every message. If WhatsApp drops, the post waits (up to 10 minutes) for the reconnect and carries on with the remaining groups. A message that failed only because the connection closed is retried once.
 - Each group is saved as done as soon as it is posted to. If the service restarts part-way, the post resumes for the groups not yet posted to (up to 3 hours later) and never repeats the ones that already got it.

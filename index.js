@@ -14,11 +14,14 @@ const http = require('node:http');
 const path = require('node:path');
 const pino = require('pino');
 require('dotenv').config();
-const { ODOI_IMAGE_NAME, isPostingDay, selectExtraImage, selectImage, selectOdoiImage, weekdayNameFor } = require('./lib/image-selection');
-const { enabledSteps, getChain, slotKey, stepLabel, validateChains } = require('./lib/chain');
+const { ODOI_IMAGE_NAME, selectExtraImage, selectNamedImage, selectOdoiImage, weekdayNameFor } = require('./lib/image-selection');
+const { enabledSteps, getChain, slotKey, stepKeys, stepLabel, validateChains } = require('./lib/chain');
 const { renderOrderPage } = require('./lib/order-page');
+const { renderBackupPage, renderCaptionsPage, renderGroupsPage, renderHomePage, renderSchedulePage } = require('./lib/pages');
+const { buildBackup, normalizeSchedule, scheduleWarnings, splitVariants, validateBackup, validateCaptions, validateSchedule } = require('./lib/settings');
+const { fail } = require('./lib/validation');
 const { localDateKeyFor, localSecondsFor, planDay } = require('./lib/post-schedule');
-const { BREILINE_CAPTION, BROLINE_CAPTION, ODOI_CAPTION, drawVariant, formatPost } = require('./lib/content');
+const { BREILINE_CAPTION, BROLINE_CAPTION, ODOI_CAPTION, drawIndex, drawVariant, formatPost } = require('./lib/content');
 
 const timezone = process.env.SCHEDULE_TIMEZONE || 'Africa/Nairobi';
 const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
@@ -104,6 +107,10 @@ const CHAIN_LAG_MS = { min: 25_000, max: 35_000 };
 const planPath = path.join(sessionPath, 'daily-plan.json');
 const statePath = path.join(sessionPath, 'state.json');
 const scheduledEntries = new Set();
+// Timers of posts waiting for their time, so a re-plan can cancel the ones it replaces.
+const entryTimers = new Map();
+// The plan for today, kept in memory so running posts and a re-plan always share one object.
+let currentPlan;
 // Commands older than this are ignored, so replayed chat history never pauses or resumes anything.
 const COMMAND_MAX_AGE_SECONDS = 120;
 
@@ -124,6 +131,20 @@ function saveState(patch) {
     } catch (error) {
         console.error('Could not save the state file:', error);
     }
+}
+
+// Settings changed from the browser pages, all kept in the same state file on the volume.
+function getSchedule() {
+    return normalizeSchedule(loadState().schedule);
+}
+
+function getCustomImages() {
+    return loadState().customImages || [];
+}
+
+function getCaptions() {
+    const saved = loadState().captions || {};
+    return { window: saved.window || {}, odoi: saved.odoi || '', broline: saved.broline || '', breiline: saved.breiline || '' };
 }
 
 function loadPaused() {
@@ -281,33 +302,47 @@ const server = http.createServer(async (request, response) => {
         return;
     }
 
-    const adminPaths = ['/pause', '/resume', '/status', '/groups', '/manage', '/order', '/addgroup', '/removegroup'];
-    const isOrderSave = request.method === 'POST' && url.pathname === '/order';
-    if ((request.method !== 'GET' && !isOrderSave) || !adminPaths.includes(url.pathname) || !tokenMatches(url.searchParams.get('token'))) {
+    const token = url.searchParams.get('token');
+    const getPaths = ['/pause', '/resume', '/status', '/groups', '/manage', '/order', '/settings', '/schedule', '/captions', '/backup', '/backup.json', '/drivefiles', '/addgroup', '/removegroup'];
+    const postPaths = ['/order', '/schedule', '/captions', '/groupsave', '/restore', '/replan'];
+    const isPost = request.method === 'POST';
+    if ((!isPost && request.method !== 'GET') || !(isPost ? postPaths : getPaths).includes(url.pathname) || !tokenMatches(token)) {
         send(404, 'not found');
         return;
     }
 
     try {
-        if (url.pathname === '/order') {
-            if (isOrderSave) {
-                let chains;
-                try {
-                    chains = validateChains(JSON.parse(await readBody(request)));
-                } catch (error) {
-                    send(400, error.message);
-                    return;
-                }
-                saveState({ chains });
-                console.log('Post image order updated from the /order page.');
-                send(200, 'saved');
-            } else {
-                send(200, orderPage(url.searchParams.get('token')), 'text/html');
-            }
+        if (isPost) {
+            await handlePost(url.pathname, request, send);
+        } else if (url.pathname === '/order') {
+            send(200, orderPage(token), 'text/html');
+        } else if (url.pathname === '/settings') {
+            send(200, renderHomePage({ token, statusText: statusText(), warning: storageWarning() }), 'text/html');
+        } else if (url.pathname === '/schedule') {
+            send(200, renderSchedulePage({ token, schedule: getSchedule(), warnings: scheduleWarnings(getSchedule()), todayLines: todayLines(), timezone }), 'text/html');
+        } else if (url.pathname === '/captions') {
+            send(200, renderCaptionsPage({
+                token,
+                schedule: getSchedule(),
+                captions: getCaptions(),
+                customImages: getCustomImages(),
+                builtIn: { odoi: ODOI_CAPTION, broline: BROLINE_CAPTION, breiline: BREILINE_CAPTION },
+            }), 'text/html');
+        } else if (url.pathname === '/backup') {
+            send(200, renderBackupPage({ token }), 'text/html');
+        } else if (url.pathname === '/backup.json') {
+            response.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'content-disposition': `attachment; filename="settings-backup-${localDateKeyFor(new Date(), timezone)}.json"`,
+            });
+            response.end(JSON.stringify(buildBackup(loadState()), null, 2));
+        } else if (url.pathname === '/drivefiles') {
+            const names = (await listImagesInFolder().catch(() => [])).map((file) => file.name);
+            send(200, JSON.stringify(names), 'application/json');
         } else if (url.pathname === '/groups') {
             send(200, await groupsText());
         } else if (url.pathname === '/manage') {
-            send(200, await manageGroupsPage(url.searchParams.get('token')), 'text/html');
+            send(200, await groupsPage(token), 'text/html');
         } else if (url.pathname === '/addgroup' || url.pathname === '/removegroup') {
             const id = (url.searchParams.get('id') || '').trim();
             if (!GROUP_ID_PATTERN.test(id)) {
@@ -316,7 +351,7 @@ const server = http.createServer(async (request, response) => {
             }
             const message = await updateGroup(id, url.pathname === '/addgroup' ? 'add' : 'remove');
             if (url.searchParams.get('back') === '1') {
-                response.writeHead(302, { location: `/manage?token=${encodeURIComponent(url.searchParams.get('token'))}` });
+                response.writeHead(302, { location: `/manage?token=${encodeURIComponent(token)}` });
                 response.end();
                 return;
             }
@@ -330,6 +365,10 @@ const server = http.createServer(async (request, response) => {
             send(200, statusText());
         }
     } catch (error) {
+        if (error.status === 400) {
+            send(400, error.message);
+            return;
+        }
         console.error('Admin link failed:', error);
         send(500, 'Something went wrong; check the logs.');
     }
@@ -343,7 +382,7 @@ server.listen(Number(process.env.PORT) || 3000, '0.0.0.0', () => {
     console.log(`Health endpoint listening on port ${server.address().port}.`);
 });
 
-function readBody(request, limit = 20_000) {
+function readBody(request, limit = 300_000) {
     return new Promise((resolve, reject) => {
         let data = '';
         request.on('data', (chunk) => {
@@ -366,35 +405,123 @@ function orderPage(token) {
             today[slotKey(entry.period, slotOf(plan, entry))] = `Today: ${formatSeconds(entry.atSecond)} - ${entry.status}`;
         }
     }
-    return renderOrderPage({ token, chains: loadState().chains, today });
+    return renderOrderPage({ token, chains: loadState().chains, schedule: getSchedule(), customImages: getCustomImages(), today });
 }
 
-function escapeHtml(text) {
-    return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
-}
-
-// Browser page listing every group this account is in, with its ID and add/remove buttons,
-// so you never need to type anything inside a group.
-async function manageGroupsPage(token) {
-    const page = (body) => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Groups</title>
-<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:1rem auto;padding:0 1rem}li{margin:.7rem 0;padding:.6rem;border:1px solid #8884;border-radius:8px}code{font-size:.8rem;word-break:break-all}a.b{display:inline-block;margin-top:.4rem;padding:.3rem .8rem;border-radius:6px;background:#1a7f4b;color:#fff;text-decoration:none}a.r{background:#b3261e}</style>${body}`;
-    if (whatsappStatus !== 'connected' || !whatsappSocket) {
-        return page('<p>WhatsApp is not connected yet. Refresh in a minute.</p>');
+// Every group this account is in, with whether it can post there and why not.
+async function groupRows() {
+    const socket = whatsappStatus === 'connected' ? whatsappSocket : undefined;
+    if (!socket) {
+        return undefined;
     }
 
-    const all = Object.values(await whatsappSocket.groupFetchAllParticipating());
-    all.sort((x, y) => String(x.subject).localeCompare(String(y.subject)));
-    const posting = new Set(getGroupIds());
-    const encodedToken = encodeURIComponent(token);
-    const items = all.map((group) => {
-        const on = posting.has(group.id);
-        const action = on ? 'removegroup' : 'addgroup';
-        return `<li><b>${escapeHtml(group.subject)}</b> ${on ? '(posting)' : ''}<br><code>${escapeHtml(group.id)}</code><br>`
-            + `<a class="b ${on ? 'r' : ''}" href="/${action}?token=${encodedToken}&id=${encodeURIComponent(group.id)}&back=1">${on ? 'Remove' : 'Add'}</a></li>`;
+    const all = await socket.groupFetchAllParticipating();
+    const selected = new Set(getGroupIds());
+    const rows = Object.values(all).map((group) => ({
+        id: group.id,
+        name: String(group.subject || group.id),
+        selected: selected.has(group.id),
+        reason: blockerFromMetadata(socket, group) || '',
+        lastError: groupProblems.get(group.id) || '',
+    }));
+    for (const id of selected) {
+        if (!all[id]) {
+            rows.push({ id, name: id, selected: true, reason: "not one of this account's groups any more", lastError: '' });
+        }
+    }
+    return rows.sort((x, y) => x.name.localeCompare(y.name));
+}
+
+async function groupsPage(token) {
+    const rows = await groupRows();
+    return renderGroupsPage({
+        token,
+        connected: Boolean(rows),
+        groups: rows || [],
+        warning: storageWarning(),
+        envLine: `WHATSAPP_GROUP_IDS=${getGroupIds().join(',')}`,
     });
-    const warning = storageWarning();
-    return page(`<h2>Groups (${posting.size} posting)</h2>${warning ? `<p><b>${escapeHtml(warning)}</b></p>` : ''}<ul style="list-style:none;padding:0">${items.join('')}</ul>`
-        + `<p>To make the list permanent even without a volume, set <code>WHATSAPP_GROUP_IDS=${escapeHtml([...posting].join(','))}</code> in Railway.</p>`);
+}
+
+// Sets the posting list to the ticked groups. Groups that cannot be posted to are never added.
+async function saveGroupSelection(ids) {
+    if (!Array.isArray(ids) || !ids.every((id) => GROUP_ID_PATTERN.test(id))) {
+        fail('ids must be a list of group IDs.');
+    }
+    const rows = await groupRows();
+    if (!rows) {
+        fail('WhatsApp is not connected yet; try again in a minute.');
+    }
+
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const current = new Set(getGroupIds());
+    const wanted = new Set(ids);
+    let added = 0;
+    let removed = 0;
+    const refused = [];
+    for (const id of wanted) {
+        if (current.has(id)) {
+            continue;
+        }
+        const row = byId.get(id);
+        if (!row || row.reason) {
+            refused.push(`${row?.name || id}: ${row?.reason || 'not one of this account\'s groups'}`);
+            continue;
+        }
+        changeGroupList(id, 'add');
+        added += 1;
+    }
+    for (const id of current) {
+        if (!wanted.has(id)) {
+            changeGroupList(id, 'remove');
+            removed += 1;
+        }
+    }
+    const lines = [`Saved. Added ${added}, removed ${removed}. Now posting to ${getGroupIds().length} group(s).`];
+    if (refused.length > 0) {
+        lines.push('Not added:', ...refused);
+    }
+    console.log(`Groups updated from the Groups page: +${added} -${removed}.`);
+    return lines.join('\n');
+}
+
+// Changes saved from the settings pages. Nothing here needs a redeploy.
+async function handlePost(pathname, request, send) {
+    let body;
+    try {
+        body = JSON.parse((await readBody(request)) || '{}');
+    } catch {
+        send(400, 'That is not valid JSON.');
+        return;
+    }
+
+    const json = (payload) => send(200, JSON.stringify(payload), 'application/json');
+    if (pathname === '/order') {
+        saveState({ chains: validateChains(body, stepKeys(getCustomImages())) });
+        console.log('Post image order updated from the settings page.');
+        send(200, 'saved');
+    } else if (pathname === '/schedule') {
+        const schedule = validateSchedule(body.schedule);
+        saveState({ schedule });
+        console.log('Schedule updated from the settings page.');
+        const message = body.replan ? `Saved. ${replanToday()}` : 'Saved. It applies from the next day\'s plan.';
+        json({ message, warnings: scheduleWarnings(schedule), today: todayLines().join('\n') });
+    } else if (pathname === '/replan') {
+        json({ message: replanToday(), today: todayLines().join('\n') });
+    } else if (pathname === '/captions') {
+        const { captions, customImages } = validateCaptions(body);
+        saveState({ captions, customImages });
+        console.log('Texts updated from the settings page.');
+        send(200, 'saved');
+    } else if (pathname === '/groupsave') {
+        json({ message: await saveGroupSelection(body.ids) });
+    } else if (pathname === '/restore') {
+        const patch = validateBackup(body);
+        saveState(patch);
+        groupCheckCache.clear();
+        console.log(`Settings restored from a backup: ${Object.keys(patch).join(', ') || 'nothing'}.`);
+        json({ message: `Restored: ${Object.keys(patch).join(', ') || 'nothing found in the file'}. It applies to posts that have not started yet.` });
+    }
 }
 
 function messageText(message) {
@@ -408,8 +535,19 @@ function slotOf(plan, entry) {
 }
 
 function chainLabel(plan, entry) {
-    const steps = enabledSteps(getChain(loadState().chains, entry.period, slotOf(plan, entry)));
-    return steps.map((key) => stepLabel(key, entry.period)).join(' > ') || 'nothing';
+    const customImages = getCustomImages();
+    const windowName = getSchedule().windows.find((window) => window.id === entry.period)?.name || entry.period;
+    const steps = enabledSteps(getChain(loadState().chains, entry.period, slotOf(plan, entry), stepKeys(customImages)));
+    return steps.map((key) => stepLabel(key, windowName, customImages)).join(' > ') || 'nothing';
+}
+
+// What is planned (and how it went) for the rest of today, one line per post.
+function todayLines() {
+    const plan = loadPlan();
+    if (plan?.dateKey !== localDateKeyFor(new Date(), timezone)) {
+        return [];
+    }
+    return plan.entries.map((entry) => `${formatSeconds(entry.atSecond)} ${chainLabel(plan, entry)} - ${entry.status}`);
 }
 
 function statusText() {
@@ -429,11 +567,8 @@ function statusText() {
             lines.push(`${groupId.slice(0, 12)}... - ${reason}`);
         }
     }
-    if (plan?.dateKey === localDateKeyFor(new Date(), timezone) && plan.entries.length > 0) {
-        lines.push(`Today (${timezone}):`);
-        for (const entry of plan.entries) {
-            lines.push(`${formatSeconds(entry.atSecond)} ${chainLabel(plan, entry)} - ${entry.status}`);
-        }
+    if (todayLines().length > 0) {
+        lines.push(`Today (${timezone}):`, ...todayLines());
     } else {
         lines.push('No posts planned for the rest of today.');
     }
@@ -657,6 +792,20 @@ async function listImagesInFolder() {
 // Works out whether this account can post in a group. Only definite problems skip a
 // group (it was removed, or only admins may post and we are not one); anything unclear
 // is treated as "try sending".
+// A definite reason this account cannot post in a group, from its metadata, or undefined.
+function blockerFromMetadata(socket, metadata) {
+    const mine = [socket.user?.id, socket.user?.lid].filter(Boolean).map((id) => jidNormalizedUser(id));
+    const self = metadata.participants?.find((participant) => (
+        [participant.id, participant.lid, participant.phoneNumber]
+            .filter(Boolean)
+            .some((id) => mine.includes(jidNormalizedUser(id)))
+    ));
+    if (metadata.announce && self && !self.admin) {
+        return 'only admins can post in this group';
+    }
+    return undefined;
+}
+
 async function groupBlocker(socket, groupId) {
     const cached = groupCheckCache.get(groupId);
     if (cached && Date.now() - cached.at < GROUP_CHECK_TTL_MS) {
@@ -665,16 +814,7 @@ async function groupBlocker(socket, groupId) {
 
     let problem;
     try {
-        const metadata = await socket.groupMetadata(groupId);
-        const mine = [socket.user?.id, socket.user?.lid].filter(Boolean).map((id) => jidNormalizedUser(id));
-        const self = metadata.participants?.find((participant) => (
-            [participant.id, participant.lid, participant.phoneNumber]
-                .filter(Boolean)
-                .some((id) => mine.includes(jidNormalizedUser(id)))
-        ));
-        if (metadata.announce && self && !self.admin) {
-            problem = 'only admins can post in this group';
-        }
+        problem = blockerFromMetadata(socket, await socket.groupMetadata(groupId));
     } catch (error) {
         const code = error?.output?.statusCode ?? error?.data;
         if ([403, 404].includes(code) || /forbidden|not-authorized|item-not-found/i.test(String(error?.message))) {
@@ -792,39 +932,76 @@ async function downloadImage(image) {
 // Builds what is sent for one step of a post chain, or undefined (with a log line) when that
 // step cannot be sent, so the rest of the chain still goes out.
 async function buildStep(key, entry, files, wordingHolder) {
-    const period = entry.period;
+    const captions = getCaptions();
+
     if (key === 'regular') {
-        const image = selectImage(files, period);
-        // The window's image is needed for morning and evening; Saturday afternoon falls back to text.
-        if (!image && period !== 'afternoon') {
-            console.log(`${period.toUpperCase()}.png was not found in the configured Drive folder; skipping that image (${entry.id}).`);
+        const window = getSchedule().windows.find((item) => item.id === entry.period);
+        if (!window) {
+            console.log(`Window "${entry.period}" no longer exists; skipping its image (${entry.id}).`);
             return undefined;
         }
-        const savedWording = loadState().wording || {};
-        const wording = drawVariant(period, savedWording[period]);
-        const caption = formatPost(period, wording.index);
-        wordingHolder.pending = { period, state: wording.state };
+
+        const image = window.image ? selectNamedImage(files, window.image) : undefined;
+        if (window.image && !image && !window.textIfMissing) {
+            console.log(`${window.image} was not found in the configured Drive folder; skipping that image (${entry.id}).`);
+            return undefined;
+        }
+
+        // Your own text for this window (several separated by ---) replaces the built-in messages.
+        const wording = loadState().wording || {};
+        const own = splitVariants(captions.window[window.id]);
+        let caption;
+        if (own.length > 0) {
+            const draw = drawIndex(own.length, wording[`custom:${window.id}`]);
+            caption = own[draw.index];
+            wordingHolder.pending = { key: `custom:${window.id}`, state: draw.state };
+        } else {
+            const draw = drawVariant(window.style, wording[window.style]);
+            caption = formatPost(window.style, draw.index);
+            wordingHolder.pending = { key: window.style, state: draw.state };
+        }
         return image
             ? { image: await downloadImage(image), mimetype: image.mimeType, caption }
             : { text: caption };
     }
 
-    const wanted = { odoi: ODOI_IMAGE_NAME.replace(/\.[^.]+$/, ''), broline: 'BROLINE', breiline: 'BREILINE' }[key];
-    const image = key === 'odoi' ? selectOdoiImage(files) : selectExtraImage(files, wanted);
+    let image;
+    let caption;
+    let label;
+    if (key === 'odoi') {
+        label = ODOI_IMAGE_NAME;
+        image = selectOdoiImage(files);
+        caption = captions.odoi || ODOI_CAPTION;
+    } else if (key === 'broline' || key === 'breiline') {
+        label = key.toUpperCase();
+        image = selectExtraImage(files, label);
+        caption = captions[key] || (key === 'broline' ? BROLINE_CAPTION : BREILINE_CAPTION);
+    } else {
+        const custom = getCustomImages().find((item) => item.id === key);
+        if (!custom) {
+            console.log(`Custom image ${key} no longer exists; skipping it (${entry.id}).`);
+            return undefined;
+        }
+        label = custom.file;
+        image = selectNamedImage(files, custom.file);
+        caption = custom.caption;
+    }
+
     if (!image) {
-        console.log(`${wanted} was not found in the configured Drive folder; skipping it (${entry.id}).`);
+        console.log(`${label} was not found in the configured Drive folder; skipping it (${entry.id}).`);
         return undefined;
     }
     const content = { image: await downloadImage(image), mimetype: image.mimeType };
-    // Each of these images has its own fixed caption, sent exactly as written.
-    content.caption = { odoi: ODOI_CAPTION, broline: BROLINE_CAPTION, breiline: BREILINE_CAPTION }[key];
+    if (caption) {
+        content.caption = caption;
+    }
     return content;
 }
 
 async function sendDailyImage(entry, { slot, alreadySent, onSent }) {
     const files = await listImagesInFolder();
-    // The order is read now, so whatever was saved on the /order page before this post started applies.
-    const steps = enabledSteps(getChain(loadState().chains, entry.period, slot));
+    // The order is read now, so whatever was saved on the settings pages before this post started applies.
+    const steps = enabledSteps(getChain(loadState().chains, entry.period, slot, stepKeys(getCustomImages())));
 
     if (!await waitForConnection()) {
         throw new Error(`WhatsApp is not connected; cannot post ${entry.id}.`);
@@ -854,7 +1031,7 @@ async function sendDailyImage(entry, { slot, alreadySent, onSent }) {
     // Only mark the wording as used when it actually reached a group.
     if (wordingHolder.pending && result.sent > 0) {
         const wording = loadState().wording || {};
-        saveState({ wording: { ...wording, [wordingHolder.pending.period]: wordingHolder.pending.state } });
+        saveState({ wording: { ...wording, [wordingHolder.pending.key]: wordingHolder.pending.state } });
     }
 
     console.log(`Posted ${messages.length} image(s) per group to ${describeResult(result)} (${entry.id}).`);
@@ -895,12 +1072,12 @@ function ensureTodayPlan() {
         return saved;
     }
 
-    const entries = planDay({
-        isPostingDay: isPostingDay(now, timezone, dateKey, lastPostDate),
-        isSaturday: weekdayNameFor(now, timezone) === 'SATURDAY',
+    const entries = (dateKey > lastPostDate ? [] : planDay({
+        schedule: getSchedule(),
         dateKey,
+        weekday: weekdayNameFor(now, timezone),
         fromSecond: localSecondsFor(now, timezone) + 120,
-    }).map((entry) => ({ ...entry, status: 'pending' }));
+    })).map((entry) => ({ ...entry, status: 'pending' }));
     const plan = { version: PLAN_VERSION, dateKey, entries };
     savePlan(plan);
     console.log(`Plan for ${dateKey} (${timezone}): ${entries.map((entry) => `${entry.period}@${formatSeconds(entry.atSecond)}`).join(', ') || 'no posts'}.`);
@@ -991,8 +1168,52 @@ function schedulePlan(plan) {
         if (interrupted) {
             console.log(`Resuming ${entry.id}; it was interrupted after ${entry.sentGroups?.length || 0} group(s).`);
         }
-        setTimeout(() => runEntry(plan, entry), Math.max(0, (entry.atSecond - nowSeconds) * 1000));
+        entryTimers.set(key, setTimeout(() => runEntry(plan, entry), Math.max(0, (entry.atSecond - nowSeconds) * 1000)));
     }
+}
+
+// Re-plans what is left of today from the current schedule. Posts already sent, running or
+// failed stay as they are and count towards their window; everything still pending is replaced.
+function replanToday() {
+    const now = new Date();
+    const dateKey = localDateKeyFor(now, timezone);
+    if (!currentPlan || currentPlan.dateKey !== dateKey) {
+        currentPlan = ensureTodayPlan();
+        schedulePlan(currentPlan);
+    }
+    const plan = currentPlan;
+
+    for (const entry of plan.entries.filter((item) => item.status === 'pending')) {
+        const key = `${plan.dateKey}:${entry.id}`;
+        clearTimeout(entryTimers.get(key));
+        entryTimers.delete(key);
+        scheduledEntries.delete(key);
+    }
+
+    const kept = plan.entries.filter((entry) => entry.status !== 'pending');
+    const doneByWindow = {};
+    for (const entry of kept) {
+        if (/^(done|running|failed)/.test(entry.status)) {
+            doneByWindow[entry.period] = (doneByWindow[entry.period] || 0) + 1;
+        }
+    }
+
+    const fresh = (dateKey > lastPostDate ? [] : planDay({
+        schedule: getSchedule(),
+        dateKey,
+        weekday: weekdayNameFor(now, timezone),
+        fromSecond: localSecondsFor(now, timezone) + 120,
+        doneByWindow,
+        idSuffix: `r${Date.now().toString(36)}-`,
+    })).map((entry) => ({ ...entry, status: 'pending' }));
+
+    plan.entries = [...kept, ...fresh].sort((a, b) => a.atSecond - b.atSecond);
+    savePlan(plan);
+    schedulePlan(plan);
+    console.log(`Re-planned today: ${fresh.map((entry) => `${entry.period}@${formatSeconds(entry.atSecond)}`).join(', ') || 'nothing more'}.`);
+    return fresh.length > 0
+        ? `Re-planned today: ${fresh.length} post(s) still to come.`
+        : 'Re-planned today: no more posts fit in the rest of today.';
 }
 
 function setupSchedules() {
@@ -1001,8 +1222,12 @@ function setupSchedules() {
     }
     schedulesStarted = true;
 
-    schedulePlan(ensureTodayPlan());
-    cron.schedule('0 0 * * *', () => schedulePlan(ensureTodayPlan()), { timezone, noOverlap: true });
+    currentPlan = ensureTodayPlan();
+    schedulePlan(currentPlan);
+    cron.schedule('0 0 * * *', () => {
+        currentPlan = ensureTodayPlan();
+        schedulePlan(currentPlan);
+    }, { timezone, noOverlap: true });
 }
 
 connectWhatsApp().catch((error) => {

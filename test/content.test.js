@@ -68,9 +68,7 @@ test('drawing does not change the saved state, and a damaged state is tolerated'
 
 test('the ODOI caption is the exact fixed text', () => {
     const { ODOI_CAPTION } = require('../lib/content');
-    assert.ok(ODOI_CAPTION.startsWith('Success is built long before the results are announced.'));
-    assert.ok(ODOI_CAPTION.endsWith('All the very best in your papers! ✨\n\nODOI JORAM'));
-    assert.equal(ODOI_CAPTION.split('\n\n').length, 5);
+    assert.equal(ODOI_CAPTION, '📌📌A new week of papers, and a new opportunity to give your best. May your mind stay sharp, your confidence remain steady, and your preparation speak for you.\n\nKeep making every paper count. Wishing you a rewarding Week 2!\n📌📌');
     assert.ok(ODOI_CAPTION.length < 1024);
 });
 
@@ -89,4 +87,18 @@ test('BROLINE and BREILINE captions are the exact fixed texts', () => {
     assert.equal(BROLINE_CAPTION.split('\n\n').length, 8);
     assert.equal(BREILINE_CAPTION, '*WISHING YOU THE VERY BEST IN YOUR EXAMS*\n*#MUMBERE BREILINE*\n*#93RD COCIS CHAIRPERSON*');
     assert.ok(BROLINE_CAPTION.length < 1024 && BREILINE_CAPTION.length < 1024);
+});
+
+test('drawIndex rotates through any pool size without repeating inside a round', () => {
+    const { drawIndex } = require('../lib/content');
+    for (const length of [1, 2, 5]) {
+        let state = {};
+        const round = [];
+        for (let i = 0; i < length; i += 1) {
+            const draw = drawIndex(length, state);
+            round.push(draw.index);
+            state = draw.state;
+        }
+        assert.equal(new Set(round).size, length);
+    }
 });

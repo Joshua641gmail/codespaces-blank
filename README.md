@@ -1,25 +1,32 @@
-# WhatsApp morning and evening image poster
+# WhatsApp scheduled image poster
 
-This service runs continuously on Railway and posts **images with a caption** to approved WhatsApp groups, Monday to Saturday, until the last post day (default `2026-12-05`, inclusive; change it with `LAST_POST_DATE`). Nothing is posted on Sundays or after that date. Times are in `Africa/Nairobi` by default (`SCHEDULE_TIMEZONE`).
+This service runs continuously on Railway and posts **images with a caption** to approved WhatsApp groups at random times inside daily windows, until the last post day (default `2026-12-05`, inclusive; change it with `LAST_POST_DATE`). Times are in `Africa/Nairobi` by default (`SCHEDULE_TIMEZONE`).
 
-| Rule | Value |
+Almost everything is changed from browser pages, with no redeploy (see **Settings pages** below). What it does out of the box:
+
+| Rule | Default |
 |---|---|
-| Morning posts | 2 per day, random times between 5:00 and 10:00 AM, image `MORNING.png` |
-| Evening posts | 2 per day, random times between 5:00 and 10:00 PM, image `EVENING.png` |
-| Saturday afternoon post | 1 on Saturdays only, random time between 12:00 and 16:00, welcome-back wording (6 messages), image `AFTERNOON.png` if present in Drive, otherwise text only |
-| Images in each post | Every post is a chain sent to each group, about 30 s apart: the window image (with the rotating message), then `ODOI.png`, then `BROLINE` (a window's first post) or `BREILINE` (its second post). So each of BROLINE and BREILINE goes out once per morning and once per evening. The Saturday afternoon post is the window image + ODOI. The order and what is included can be changed from the `/order` page |
-| Minimum gap between two posts in the same window | 1 hour |
-| 23 November 2026 only | keeps the original windows (morning 5:00-7:30 AM, evening 5:00-8:00 PM); every other day uses the wider ones (`LEGACY_WINDOW_DATES` in `lib/post-schedule.js`) |
-| New windows start | with the next day's plan; a plan already made for today is not changed |
+| Morning window | 2 posts, random times between 5:00 and 10:00 AM, image `MORNING.png`, Monday to Saturday |
+| Saturday afternoon window | 1 post, random time between 12:00 and 16:00, welcome-back wording (6 messages), image `AFTERNOON.png` if present, otherwise text only |
+| Evening window | 2 posts, random times between 5:00 and 10:00 PM, image `EVENING.png`, Monday to Saturday |
+| Gap between two posts in a window | 1 hour at least |
+| 23 November 2026 only | keeps the narrower original times (morning 5:00-7:30 AM, evening 5:00-8:00 PM) |
+| Images in each post | A chain sent to each group about 30 s apart: the window image (with its message), then `ODOI.png`, then `BROLINE` (a window's first post) or `BREILINE` (its second post). Each of BROLINE and BREILINE therefore goes out once per window |
 | Several groups | 20-90 s random pause between groups |
 
-The images are read from the configured Google Drive folder and are strictly named `MORNING.png`, `EVENING.png`, `ODOI.png`, `BROLINE`, `BREILINE` and (optional) `AFTERNOON.png`. If one is missing, that image is skipped and the rest of the post still goes out. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
+The images are read from the configured Google Drive folder. Window images, `ODOI.png` and custom images are matched by exact file name; `BROLINE` and `BREILINE` by exact name with any image extension. If one is missing, that image is skipped and the rest of the post still goes out. The day's plan is saved to `daily-plan.json` next to the WhatsApp session, so a restart or redeploy resumes it instead of creating extra posts. A post more than 30 minutes late (for example after an outage) is skipped. If the service starts late in the day, it plans only the rest of the day.
 
-## Image chain and the /order page
+## Settings pages (no redeploy needed)
 
-Each post sends several images to a group one after another, with a pause of about 30 seconds (25-35 s, so it is not an identical gap every time). By default the chain is: window image with the rotating message, `ODOI.png` (fixed caption from `lib/content.js`, `ODOI_CAPTION`), then `BROLINE` in a window's first post and `BREILINE` in its second post. `BROLINE` and `BREILINE` are matched by exact name in the Drive folder with any image extension (`BROLINE.png`, `BREILINE.jpg`) and each is sent with its own fixed caption (`BROLINE_CAPTION` and `BREILINE_CAPTION` in `lib/content.js`), exactly as written. If an image is missing the other steps still go out.
+Set `ADMIN_TOKEN` in Railway (12+ characters), then open `https://YOUR-APP.up.railway.app/settings?token=YOUR_TOKEN`. Everything below is saved on the Railway volume (see "Keeping groups across deploys") and has a Backup page for safety.
 
-**Changing the order:** open `https://YOUR-APP.up.railway.app/order?token=YOUR_TOKEN`. Each post (Morning post 1, Morning post 2, Evening post 1, Evening post 2, Afternoon post) has its images in a list. Use the arrows to move one up or down, untick to leave one out, then press Save. Saved changes apply to every post that has not started yet, at any time of day, and stay until you change them again. A post already in progress keeps the order it started with. `!status` shows each post's current order.
+- **Groups** (`/manage`): every group the account is in, split into *Posting now*, *Available to add* and *Cannot post in these*, with the reason (only admins can post, removed from the group) and the last send error if any. Groups you cannot post in cannot be ticked. Tick the ones you want and press Save. Nothing is sent to any group from this page.
+- **Schedule** (`/schedule`): add, edit or remove windows (name, start and end time, number of posts, minimum gap, days of the week, image file, message style). Special dates let one window use different times on one date. Limits: 8 windows, 6 posts per window, gap of at least 30 minutes, 20 posts per day; the page warns when the volume per day gets high or windows overlap. Saved changes start with the next day's plan. **Save and re-plan today** (or **Only re-plan today**) also re-plans today's posts that have not started yet; posts already sent are never repeated and count towards their window.
+- **Image order** (`/order`): for every post, which images are sent and in what order (arrows to move, tick to include). Changes apply to every post that has not started yet, today and on following days. A post already in progress keeps the order it started with. `!status` shows each post's current order.
+- **Texts** (`/captions`): the text sent with each image. Your text replaces the built-in one and is sent exactly as written. For a window image, leave the box empty to keep the built-in messages (with greeting and signature) or enter several texts separated by a line containing only `---`; they rotate. The ODOI, BROLINE and BREILINE boxes start with their current text and have a *Restore built-in text* button. You can also add up to 8 **custom images** from the Drive folder, each with its own text, then add them to a post on the Image order page. A caption can be at most 1,024 characters (WhatsApp's limit).
+- **Backup** (`/backup`): download all of the above (schedule, texts, custom images, image order, group list) as one file and restore it in one click if the volume is ever lost.
+
+Default ODOI text (`ODOI_CAPTION`), BROLINE text and BREILINE text live in `lib/content.js`; the Texts page overrides them without touching the code.
 
 ## Wording
 
@@ -51,13 +58,13 @@ Send these from the linked phone, ideally in your own "Message yourself" chat. O
 
 Added and removed groups are saved in `state.json` on the volume and applied on top of `WHATSAPP_GROUP_IDS`, so no redeploy is needed.
 
-**Add a group without typing a command in it:** open `https://YOUR-APP.up.railway.app/manage?token=YOUR_TOKEN`. It lists every group the account is in, with its name and ID, and an Add / Remove button for each. Nothing is sent to any group.
+**Add a group without typing a command in it:** use the Groups page (`/manage`), described above.
 
 **Add a group with a word:** send exactly `YHWH` (any case) inside a group. It adds the group, replies privately in your own chat, and deletes the message from the group. Only your own account is obeyed. To use a different word, set `ADD_GROUP_WORD` in Railway (one word, 4+ characters).
 
 ### Keeping groups across deploys
 
-Groups are saved next to the WhatsApp login in `WHATSAPP_AUTH_PATH`. That folder **must be on a Railway volume**, otherwise every deploy wipes it (`!status` and `/manage` show a warning when it looks like it is not). For a guarantee that does not depend on the volume, `/groups` and `!groups` print a ready-made line `WHATSAPP_GROUP_IDS=...`; paste it into the Railway variables and those groups are always included.
+Groups are saved next to the WhatsApp login in `WHATSAPP_AUTH_PATH`. That folder **must be on a Railway volume**, otherwise every deploy wipes it (`!status` and the settings pages show a warning when it looks like it is not). For a guarantee that does not depend on the volume, `/groups` and `!groups` print a ready-made line `WHATSAPP_GROUP_IDS=...`; paste it into the Railway variables and those groups are always included.
 
 ### Control links (more reliable than commands)
 
@@ -72,7 +79,7 @@ Anyone with the link can control the bot, so keep the token private. Without `AD
 
 ## Groups that cannot be posted to
 
-Before each post the bot checks every group. A group is skipped (and the others still get the post) when the account was removed from it, it no longer exists, or only admins can post and the account is not an admin. Skipped groups appear in `!status` and are re-checked automatically (every 20 minutes at most).
+Before each post the bot checks every group. A group is skipped (and the others still get the post) when the account was removed from it, it no longer exists, or only admins can post and the account is not an admin. Skipped groups appear in `!status` and on the Groups page, and are re-checked automatically (every 20 minutes at most).
 
 ## Configure
 
